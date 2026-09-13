@@ -5,7 +5,7 @@ use std::fmt::Debug;
 use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{OnceLock, RwLock};
 use std::thread;
 
 use log::{Log, Metadata, Record};
@@ -26,7 +26,7 @@ pub static INSTANCE_ID: OnceLock<String> = OnceLock::new();
 /// The logger.
 ///
 /// Default values matching the swagger specification (`src/firecracker/swagger/firecracker.yaml`).
-pub static LOGGER: Logger = Logger(Mutex::new(LoggerConfiguration {
+pub static LOGGER: Logger = Logger(RwLock::new(LoggerConfiguration {
     target: None,
     filter: LogFilter { module: None },
     format: LogFormat {
@@ -53,7 +53,16 @@ impl Logger {
 
     /// Applies the given logger configuration the logger.
     pub fn update(&self, config: LoggerConfig) -> Result<(), LoggerUpdateError> {
-        let mut guard = self.0.lock().unwrap();
+        // Open the file before acquiring the lock so that instrumented callees
+        // (e.g. open_file_nonblock with tracing enabled) can log without
+        // re-entering the locked Logger.
+        let file = config
+            .log_path
+            .map(|p| open_file_nonblock(&p))
+            .transpose()
+            .map_err(LoggerUpdateError)?;
+
+        let mut guard = self.0.write().unwrap();
         log::set_max_level(
             config
                 .level
@@ -61,11 +70,9 @@ impl Logger {
                 .unwrap_or(DEFAULT_LEVEL),
         );
 
-        if let Some(log_path) = config.log_path {
-            let file = open_file_nonblock(&log_path).map_err(LoggerUpdateError)?;
-
+        if let Some(file) = file {
             guard.target = Some(file);
-        };
+        }
 
         if let Some(show_level) = config.show_level {
             guard.format.show_level = show_level;
@@ -78,10 +85,6 @@ impl Logger {
         if let Some(module) = config.module {
             guard.filter.module = Some(module);
         }
-
-        // Ensure we drop the guard before attempting to log, otherwise this
-        // would deadlock.
-        drop(guard);
 
         Ok(())
     }
@@ -102,8 +105,13 @@ pub struct LoggerConfiguration {
     pub filter: LogFilter,
     pub format: LogFormat,
 }
+/// An RwLock lets log() take a read lock, which a signal handler that logs can
+/// re-acquire as a nested read. Only update() takes the write lock, and it runs
+/// pre-boot (the API rejects ConfigureLogger once the VM starts), so at runtime
+/// no writer blocks a read and a running VM cannot hang. A signal during a
+/// pre-boot update() can still block.
 #[derive(Debug)]
-pub struct Logger(pub Mutex<LoggerConfiguration>);
+pub struct Logger(pub RwLock<LoggerConfiguration>);
 
 impl Log for Logger {
     // No additional filters to <https://docs.rs/log/latest/log/fn.max_level.html>.
@@ -112,8 +120,7 @@ impl Log for Logger {
     }
 
     fn log(&self, record: &Record) {
-        // Lock the logger.
-        let mut guard = self.0.lock().unwrap();
+        let guard = self.0.read().unwrap();
 
         // Check if the log message is enabled
         {
@@ -158,7 +165,10 @@ impl Log for Logger {
                 record.args()
             );
 
-            let result = if let Some(file) = &mut guard.target {
+            // Write through a shared &File so a read lock suffices; write_all
+            // needs &mut on the reference, not the File. One write_all per line
+            // keeps output atomic.
+            let result = if let Some(mut file) = guard.target.as_ref() {
                 file.write_all(message.as_bytes())
             } else {
                 std::io::stdout().write_all(message.as_bytes())
@@ -359,7 +369,7 @@ mod tests {
             .unwrap();
 
         // Create logger.
-        let logger = Logger(Mutex::new(LoggerConfiguration {
+        let logger = Logger(RwLock::new(LoggerConfiguration {
             target: Some(target),
             filter: LogFilter {
                 module: Some(String::from("module")),
@@ -398,5 +408,29 @@ mod tests {
         );
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_logger_update_with_log_path() {
+        let logger = Logger(RwLock::new(LoggerConfiguration {
+            target: None,
+            filter: LogFilter { module: None },
+            format: LogFormat {
+                show_level: false,
+                show_log_origin: false,
+            },
+        }));
+        let tmp = vmm_sys_util::tempfile::TempFile::new().unwrap();
+        let path = tmp.as_path().to_path_buf();
+        logger
+            .update(LoggerConfig {
+                log_path: Some(path),
+                level: None,
+                show_level: None,
+                show_log_origin: None,
+                module: None,
+            })
+            .unwrap();
+        assert!(logger.0.read().unwrap().target.is_some());
     }
 }

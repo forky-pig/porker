@@ -43,6 +43,19 @@
                 "syscall": "fsync"
             },
             {
+                "syscall": "fallocate",
+                "comment": "Used by the VirtIO block device to punch holes for discard on regular backing files",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3,
+                        "comment": "FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE"
+                    }
+                ]
+            },
+            {
                 "syscall": "close"
             },
             {
@@ -234,14 +247,21 @@
             },
             {
                 "syscall": "mmap",
-                "comment": "Used by the VirtIO balloon device",
+                "comment": "Used by discard_range for the VirtIO balloon and memory (virtio-mem) devices",
                 "args": [
                     {
                         "index": 3,
                         "type": "dword",
                         "op": "eq",
-                        "val": 50,
-                        "comment": "libc::MAP_FIXED | libc::MAP_ANONYMOUS | libc::MAP_PRIVATE"
+                        "val": 16434,
+                        "comment": "libc::MAP_FIXED | libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_NORESERVE"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
             },
@@ -255,6 +275,13 @@
                         "op": "eq",
                         "val": 1,
                         "comment": "libc::MAP_SHARED"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
             },
@@ -268,6 +295,13 @@
                         "op": "eq",
                         "val": 34,
                         "comment": "libc::MAP_ANONYMOUS | libc::MAP_PRIVATE"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
             },
@@ -281,6 +315,119 @@
                         "op": "eq",
                         "val": 32769,
                         "comment": "libc::MAP_SHARED | libc::MAP_POPULATE"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
+                    }
+                ]
+            },
+            {
+                "syscall": "mmap",
+                "comment": "Used by pmem device to mmap the backing file",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 16385,
+                        "comment": "libc::MAP_SHARED | libc::MAP_NORESERVE"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
+                    }
+                ]
+            },
+            {
+                "syscall": "mmap",
+                "comment": "Used by pmem device for aligned anonymous mapping",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 16418,
+                        "comment": "libc::MAP_PRIVATE | libc::MAP_NORESERVE | libc::MAP_ANONYMOUS"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
+                    }
+                ]
+            },
+            {
+                "syscall": "mmap",
+                "comment": "Used by pmem device to overlay file mapping on anonymous region",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 16401,
+                        "comment": "libc::MAP_SHARED | libc::MAP_NORESERVE | libc::MAP_FIXED"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
+                    }
+                ]
+            },
+            {
+                "syscall": "mmap",
+                "comment": "Used by IovDeque ring buffer for net device hotplug",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 17,
+                        "comment": "libc::MAP_SHARED | libc::MAP_FIXED"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3,
+                        "comment": "libc::PROT_READ | libc::PROT_WRITE"
+                    }
+                ]
+            },
+            {
+                "syscall": "memfd_create",
+                "comment": "Used by IovDeque ring buffer for net device hotplug",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3,
+                        "comment": "MFD_CLOEXEC | MFD_ALLOW_SEALING"
+                    }
+                ]
+            },
+            {
+                "syscall": "fcntl",
+                "comment": "Used by IovDeque to seal memfd during net device hotplug",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1033,
+                        "comment": "F_ADD_SEALS"
                     }
                 ]
             },
@@ -354,6 +501,26 @@
                 ]
             },
             {
+                "syscall": "timerfd_create",
+                "comment": "Needed for creating rate limiters during device hotplug",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "CLOCK_MONOTONIC"
+                    },
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 526336,
+                        "comment": "TFD_NONBLOCK | TFD_CLOEXEC"
+                    }
+                ]
+            },
+            {
                 "syscall": "timerfd_settime",
                 "comment": "Needed for rate limiting and metrics",
                 "args": [
@@ -362,6 +529,19 @@
                         "type": "dword",
                         "op": "eq",
                         "val": 0
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Used by the VirtIO block device to pass discard through to block-device backing files",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 4727,
+                        "comment": "BLKDISCARD"
                     }
                 ]
             },
@@ -466,6 +646,123 @@
                 ]
             },
             {
+                "syscall": "ioctl",
+                "comment": "Needed for registering ioeventfds during device hotplug",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1077980793,
+                        "comment": "KVM_IOEVENTFD"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for unregistering irqfds during device hot-unplug and VM teardown (called from MsixVectorGroup::drop)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1075883638,
+                        "comment": "KVM_IRQFD"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for opening tap device during net hotplug",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1074025674,
+                        "comment": "TUNSETIFF"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for configuring tap offload during net hotplug",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1074025680,
+                        "comment": "TUNSETOFFLOAD"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for setting tap vnet header size during net hotplug",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1074025688,
+                        "comment": "TUNSETVNETHDRSZ"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for querying the logical sector size when opening a virtio-block backing file",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 4712,
+                        "comment": "BLKSSZGET"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for querying the physical block size of a block-device backing file during virtio-block init",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 4731,
+                        "comment": "BLKPBSZGET"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for querying the minimum I/O size of a block-device backing file during virtio-block init",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 4728,
+                        "comment": "BLKIOMIN"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for querying the optimal I/O size of a block-device backing file during virtio-block init",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 4729,
+                        "comment": "BLKIOOPT"
+                    }
+                ]
+            },
+            {
                 "syscall": "sched_yield",
                 "comment": "Used by the rust standard library in std::sync::mpmc. Firecracker uses mpsc channels from this module for inter-thread communication"
             },
@@ -483,7 +780,16 @@
             },
             {
                 "syscall": "mprotect",
-                "comment": "Used by memory hotplug to protect access to underlying host memory"
+                "comment": "Used by memory hotplug to protect access to underlying host memory",
+                "args": [
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
+                    }
+                ]
             }
         ]
     },
@@ -550,6 +856,10 @@
             {
                 "syscall": "rt_sigprocmask",
                 "comment": "rt_sigprocmask is used by Rust stdlib to remove custom signal handler during thread teardown."
+            },
+            {
+                "syscall": "rt_sigreturn",
+                "comment": "rt_sigreturn is needed so sigpipe_handler can return and resume the thread."
             },
             {
                 "syscall": "sigaltstack",
@@ -673,6 +983,13 @@
                         "op": "eq",
                         "val": 1,
                         "comment": "libc::MAP_SHARED"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
             },
@@ -686,6 +1003,13 @@
                         "op": "eq",
                         "val": 34,
                         "comment": "libc::MAP_ANONYMOUS | libc::MAP_PRIVATE"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
             },
@@ -786,6 +1110,18 @@
             },
             {
                 "syscall": "close"
+            },
+            {
+                "syscall": "eventfd2",
+                "comment": "Needed for recreating the MSI-X vector eventfds when a PCI device is reset by the guest (MsixVectorGroup recreated from the vCPU thread)"
+            },
+            {
+                "syscall": "io_uring_enter",
+                "comment": "Needed to drain the async block IO engine's io_uring when the device is reset by the guest (from the vCPU thread)"
+            },
+            {
+                "syscall": "epoll_ctl",
+                "comment": "Needed to remove the vsock muxer's connection and listener epoll listeners when the device is reset by the guest (from the vCPU thread)"
             },
             {
                 "syscall": "fstat",
@@ -911,6 +1247,13 @@
                         "op": "eq",
                         "val": 1,
                         "comment": "libc::MAP_SHARED"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
             },
@@ -969,6 +1312,19 @@
                         "op": "eq",
                         "val": 6,
                         "comment": "SIGABRT"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed to relocate notify ioeventfds when the guest reprograms a BAR",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1077980793,
+                        "comment": "KVM_IOEVENTFD"
                     }
                 ]
             },

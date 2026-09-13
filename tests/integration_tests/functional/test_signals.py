@@ -5,10 +5,15 @@
 import json
 import os
 import resource as res
+import subprocess
+import urllib.parse
 from signal import SIGBUS, SIGHUP, SIGILL, SIGPIPE, SIGSEGV, SIGSYS, SIGXCPU, SIGXFSZ
 from time import sleep
 
 import pytest
+
+from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel, pin_rootfs_mode
+from framework.http_api import Session
 
 signum_str = {
     SIGBUS: "sigbus",
@@ -22,14 +27,15 @@ signum_str = {
 }
 
 
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
 @pytest.mark.parametrize(
     "signum", [SIGBUS, SIGSEGV, SIGXFSZ, SIGXCPU, SIGPIPE, SIGHUP, SIGILL, SIGSYS]
 )
-def test_generic_signal_handler(uvm_plain, signum):
+def test_generic_signal_handler(uvm, signum):
     """
     Test signal handling for all handled signals.
     """
-    microvm = uvm_plain
+    microvm = uvm
     microvm.spawn()
 
     # We don't need to monitor the memory for this test.
@@ -45,9 +51,8 @@ def test_generic_signal_handler(uvm_plain, signum):
     assert len(line_metrics) == 1
 
     os.kill(microvm.firecracker_pid, signum)
-    # Firecracker gracefully handles SIGPIPE (doesn't terminate).
+    # Firecracker gracefully handles SIGPIPE (doesn't terminate) and logs nothing.
     if signum == int(SIGPIPE):
-        msg = "Received signal 13"
         # Flush metrics to file, so we can see the SIGPIPE at bottom assert.
         # This is going to fail if process has exited.
         microvm.api.actions.put(action_type="FlushMetrics")
@@ -56,18 +61,59 @@ def test_generic_signal_handler(uvm_plain, signum):
 
         microvm.mark_killed()
 
-    microvm.check_log_message(msg)
+        microvm.check_log_message(msg)
 
     if signum != SIGSYS:
         metric_line = json.loads(metrics_fd.readlines()[0])
         assert metric_line["signals"][signum_str[signum]] == 1
 
 
-def test_sigxfsz_handler(uvm_plain_rw):
+def test_sigpipe_from_log_write(microvm_factory, tmp_path):
+    """
+    Test that a SIGPIPE raised by Firecracker's own log write is survivable.
+
+    With no log path configured the log target is stdout, so putting stdout on a
+    pipe and dropping the read end makes the next request log, and so raise
+    SIGPIPE on the thread that is already inside the log write.
+    """
+    sock = tmp_path / "fc.sock"
+    url = f"http+unix://{urllib.parse.quote(str(sock), safe='')}/"
+    read_fd, write_fd = os.pipe()
+    proc = subprocess.Popen(
+        [str(microvm_factory.fc_binary_path), "--api-sock", str(sock)],
+        stdout=write_fd,
+        stderr=write_fd,
+    )
+    os.close(write_fd)
+    try:
+        for _ in range(100):
+            if sock.exists():
+                break
+            sleep(0.05)
+
+        session = Session()
+        assert session.get(url, timeout=5).status_code == 200
+
+        # Drop the read end, so the log write of the next request gets EPIPE.
+        os.close(read_fd)
+        read_fd = None
+
+        assert session.get(url, timeout=5).status_code == 200
+        assert proc.poll() is None, f"Firecracker exited with {proc.poll()}"
+    finally:
+        if read_fd is not None:
+            os.close(read_fd)
+        proc.kill()
+        proc.wait()
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+@pin_rootfs_mode("rw")
+def test_sigxfsz_handler(uvm):
     """
     Test intercepting and handling SIGXFSZ.
     """
-    microvm = uvm_plain_rw
+    microvm = uvm
     microvm.spawn()
 
     # We don't need to monitor the memory for this test.
@@ -100,11 +146,12 @@ def test_sigxfsz_handler(uvm_plain_rw):
     assert metric_line["signals"]["sigxfsz"] == 1
 
 
-def test_handled_signals(uvm_plain):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_handled_signals(uvm):
     """
     Test that handled signals don't kill the microVM.
     """
-    microvm = uvm_plain
+    microvm = uvm
     microvm.spawn()
 
     # We don't need to monitor the memory for this test.

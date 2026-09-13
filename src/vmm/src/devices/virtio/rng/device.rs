@@ -59,7 +59,7 @@ pub struct Entropy {
     queue_events: Vec<EventFd>,
 
     // Device specific fields
-    rate_limiter: RateLimiter,
+    pub(crate) rate_limiter: RateLimiter,
 
     buffer: IoVecBufferMut,
 }
@@ -247,14 +247,6 @@ impl Entropy {
         self.acked_features = features;
     }
 
-    pub(crate) fn set_activated(
-        &mut self,
-        mem: GuestMemoryMmap,
-        interrupt: Arc<dyn VirtioInterrupt>,
-    ) {
-        self.device_state = DeviceState::Activated(ActiveState { mem, interrupt });
-    }
-
     pub(crate) fn activate_event(&self) -> &EventFd {
         &self.activate_event
     }
@@ -299,7 +291,9 @@ impl VirtioDevice for Entropy {
         self.acked_features = acked_features;
     }
 
-    fn read_config(&self, _offset: u64, mut _data: &mut [u8]) {}
+    fn config_as_bytes(&self) -> &[u8] {
+        &[]
+    }
 
     fn write_config(&mut self, _offset: u64, _data: &[u8]) {}
 
@@ -307,11 +301,21 @@ impl VirtioDevice for Entropy {
         self.device_state.is_activated()
     }
 
+    fn deactivate(&mut self) {
+        self.device_state = DeviceState::Inactive;
+    }
+
+    fn _reset(&mut self) -> bool {
+        true
+    }
+
     fn activate(
         &mut self,
         mem: GuestMemoryMmap,
         interrupt: Arc<dyn VirtioInterrupt>,
     ) -> Result<(), ActivateError> {
+        assert!(!self.is_activated());
+
         for q in self.queues.iter_mut() {
             q.initialize(&mem)
                 .map_err(ActivateError::QueueMemoryError)?;
@@ -374,21 +378,9 @@ mod tests {
     }
 
     #[test]
-    fn test_read_config() {
+    fn test_config_as_bytes() {
         let entropy_dev = default_entropy();
-        let mut config = vec![0; 10];
-
-        entropy_dev.read_config(0, &mut config);
-        assert_eq!(config, vec![0; 10]);
-
-        entropy_dev.read_config(1, &mut config);
-        assert_eq!(config, vec![0; 10]);
-
-        entropy_dev.read_config(2, &mut config);
-        assert_eq!(config, vec![0; 10]);
-
-        entropy_dev.read_config(1024, &mut config);
-        assert_eq!(config, vec![0; 10]);
+        assert!(entropy_dev.config_as_bytes().is_empty());
     }
 
     #[test]
@@ -522,7 +514,7 @@ mod tests {
     fn test_bandwidth_rate_limiter() {
         let mem = create_virtio_mem();
         // Rate Limiter with 4000 bytes / sec allowance and no initial burst allowance
-        let device = Entropy::new(RateLimiter::new(4000, 0, 1000, 0, 0, 0).unwrap()).unwrap();
+        let device = Entropy::new(RateLimiter::new(4000, 0, 1000, 0, 0, 0)).unwrap();
         let mut th = VirtioTestHelper::<Entropy>::new(&mem, device);
 
         th.activate_device(&mem);
@@ -570,7 +562,7 @@ mod tests {
         let mem = create_virtio_mem();
         // Rate Limiter with unlimited bandwidth and allowance for 1 operation every 100 msec,
         // (10 ops/sec), without initial burst.
-        let device = Entropy::new(RateLimiter::new(0, 0, 0, 1, 0, 100).unwrap()).unwrap();
+        let device = Entropy::new(RateLimiter::new(0, 0, 0, 1, 0, 100)).unwrap();
         let mut th = VirtioTestHelper::<Entropy>::new(&mem, device);
 
         th.activate_device(&mem);

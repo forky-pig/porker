@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use vm_memory::GuestAddress;
 
 use crate::logger::warn;
+use crate::utils::Version;
 
 /// Module for aarch64 related functionality.
 #[cfg(target_arch = "aarch64")]
@@ -18,7 +19,7 @@ pub use aarch64::kvm::{Kvm, KvmArchError, OptionalCapabilities};
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::vcpu::*;
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::vm::{ArchVm, ArchVmError, VmState};
+pub use aarch64::vm::{KvmVm, KvmVmError, VmState};
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::{
     ConfigurationError, arch_memory_regions, configure_system_for_boot, get_kernel_start,
@@ -34,7 +35,7 @@ pub use x86_64::kvm::{Kvm, KvmArchError};
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::vcpu::*;
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::vm::{ArchVm, ArchVmError, VmState};
+pub use x86_64::vm::{KvmVm, KvmVmError, VmState};
 
 #[cfg(target_arch = "x86_64")]
 pub use crate::arch::x86_64::{
@@ -75,6 +76,48 @@ pub fn host_page_size() -> usize {
     *PAGE_SIZE
 }
 
+/// Parses the `major.minor.patch` prefix of a kernel release string
+/// Missing components are treated as 0.
+fn parse_kernel_release(release: &str) -> Version {
+    let mut components = release.split(|c: char| !c.is_ascii_digit());
+
+    let major: u8 = components
+        .next()
+        .and_then(|component| component.parse().ok())
+        .unwrap_or(0);
+    let minor: u8 = components
+        .next()
+        .and_then(|component| component.parse().ok())
+        .unwrap_or(0);
+    let patch: u16 = components
+        .next()
+        .and_then(|component| component.parse().ok())
+        .unwrap_or(0);
+    Version::new(major, minor, patch)
+}
+
+/// Returns the [`Version`] of the kernel running on the host.
+pub fn host_kernel_version() -> Version {
+    static KERNEL_VERSION: LazyLock<Version> = LazyLock::new(|| {
+        // SAFETY: zeroed `libc::utsname` is valid.
+        let mut utsname: libc::utsname = unsafe { std::mem::zeroed() };
+        // SAFETY: Argument is correct.
+        let ret = unsafe { libc::uname(&mut utsname) };
+        if ret < 0 {
+            warn!("Could not get host kernel version. Defaulting to 0.0.0");
+            return Version::default();
+        }
+
+        // SAFETY: `release` is a null terminated ASCII string.
+        let release = unsafe { std::ffi::CStr::from_ptr(utsname.release.as_ptr()) };
+        let release = release.to_str().unwrap_or_default();
+
+        parse_kernel_release(release)
+    });
+
+    *KERNEL_VERSION
+}
+
 impl fmt::Display for DeviceType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{:?}", self)
@@ -110,6 +153,10 @@ pub struct EntryPoint {
     pub entry_addr: GuestAddress,
     /// Specifies which boot protocol to use
     pub protocol: BootProtocol,
+    /// Setup header from a bzImage kernel, used to seed the zero page.
+    /// `None` for ELF (`vmlinux`) kernels.
+    #[cfg(target_arch = "x86_64")]
+    pub setup_header: Option<linux_loader::loader::bootparam::setup_header>,
 }
 
 /// Adds in [`regions`] the valid memory regions suitable for RAM taking into account a gap in the
@@ -138,5 +185,23 @@ fn arch_memory_regions_with_gap(
         }
         // case2: region starts past the gap
         Some(_) => Some((first_addr_past_gap.max(region_start), region_size)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_kernel_release() {
+        assert_eq!(parse_kernel_release("1"), Version::new(1, 0, 0));
+        assert_eq!(parse_kernel_release("1.2"), Version::new(1, 2, 0));
+        assert_eq!(parse_kernel_release("1.2.3"), Version::new(1, 2, 3));
+        assert_eq!(parse_kernel_release("1.2.300"), Version::new(1, 2, 300));
+        assert_eq!(
+            parse_kernel_release("1.2.3-69-something"),
+            Version::new(1, 2, 3)
+        );
+        assert_eq!(parse_kernel_release("invalid"), Version::default());
     }
 }

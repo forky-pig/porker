@@ -86,7 +86,7 @@ rebranded. See [docs/UPSTREAM.md](docs/UPSTREAM.md) for why.
 
 ## Releases
 
-Latest release: see [GitHub releases](../../releases) (v0.1.0 incoming).
+Latest release: see [GitHub releases](../../releases).
 Changes are recorded in [CHANGELOG.md](CHANGELOG.md); Porker entries are at
 the top, upstream Firecracker entries are preserved below.
 

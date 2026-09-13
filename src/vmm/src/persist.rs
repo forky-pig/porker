@@ -26,6 +26,9 @@ use crate::cpu_config::x86_64::cpuid::CpuidTrait;
 #[cfg(target_arch = "x86_64")]
 use crate::cpu_config::x86_64::cpuid::common::get_vendor_id_from_host;
 use crate::device_manager::{DevicePersistError, DevicesState};
+// Re-exported so external crates inspecting a `MicrovmState` snapshot can match on the
+// serialised virtio transport variant.
+pub use crate::device_manager::VirtioDevicesState;
 use crate::logger::{info, warn};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
@@ -133,8 +136,8 @@ pub enum MicrovmStateError {
     RestoreDevices(#[from] DevicePersistError),
     /// Cannot save Vcpu state: {0}
     SaveVcpuState(vstate::vcpu::VcpuError),
-    /// Cannot save Vm state: {0}
-    SaveVmState(vstate::vm::ArchVmError),
+    /// Cannot save KvmVm state: {0}
+    SaveVmState(vstate::vm::KvmVmError),
     /// Cannot signal Vcpu: {0}
     SignalVcpu(VcpuSendEventError),
     /// Vcpu is in unexpected state.
@@ -160,7 +163,7 @@ pub enum CreateSnapshotError {
 }
 
 /// Snapshot version
-pub const SNAPSHOT_VERSION: Version = Version::new(10, 0, 0);
+pub const SNAPSHOT_VERSION: Version = Version::new(12, 0, 0);
 
 /// Creates a Microvm snapshot.
 pub fn create_snapshot(
@@ -172,16 +175,28 @@ pub fn create_snapshot(
         .save_state(vm_info)
         .map_err(CreateSnapshotError::MicrovmState)?;
 
-    snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
+    snapshot_state_to_file(
+        &microvm_state,
+        &params.snapshot_path,
+        params.sync_snapshot_files,
+    )?;
 
-    vmm.vm
-        .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
+    let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
+        CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
+            "snapshot requires KVM".into(),
+        ))
+    })?;
+    kvm_vm.snapshot_memory_to_file(
+        &params.mem_file_path,
+        params.snapshot_type,
+        params.sync_snapshot_files,
+    )?;
 
     // We need to mark queues as dirty again for all activated devices. The reason we
     // do it here is that we don't mark pages as dirty during runtime
     // for queue objects.
     vmm.device_manager
-        .mark_virtio_queue_memory_dirty(vmm.vm.guest_memory());
+        .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
 
     Ok(())
 }
@@ -189,6 +204,7 @@ pub fn create_snapshot(
 fn snapshot_state_to_file(
     microvm_state: &MicrovmState,
     snapshot_path: &Path,
+    sync_snapshot_files: bool,
 ) -> Result<(), CreateSnapshotError> {
     use self::CreateSnapshotError::*;
     let mut snapshot_file = OpenOptions::new()
@@ -203,9 +219,12 @@ fn snapshot_state_to_file(
     snapshot_file
         .flush()
         .map_err(|err| SnapshotBackingFile("flush", err))?;
-    snapshot_file
-        .sync_all()
-        .map_err(|err| SnapshotBackingFile("sync_all", err))
+    if sync_snapshot_files {
+        snapshot_file
+            .sync_all()
+            .map_err(|err| SnapshotBackingFile("sync_all", err))?;
+    }
+    Ok(())
 }
 
 /// Validates that snapshot CPU vendor matches the host CPU vendor.
@@ -364,21 +383,22 @@ pub fn restore_from_snapshot(
 ) -> Result<Arc<Mutex<Vmm>>, RestoreFromSnapshotError> {
     let mut microvm_state = snapshot_state_from_file(&params.snapshot_path)?;
     for entry in &params.network_overrides {
-        microvm_state
-            .device_states
-            .mmio_state
-            .net_devices
-            .iter_mut()
-            .map(|device| &mut device.device_state)
-            .chain(
-                microvm_state
-                    .device_states
-                    .pci_state
-                    .net_devices
-                    .iter_mut()
-                    .map(|device| &mut device.device_state),
-            )
-            .find(|x| x.id == entry.iface_id)
+        // Only the active transport carries virtio device state, so we look at whichever
+        // variant this snapshot was saved with. The MMIO and PCI transports wrap their net
+        // devices in distinct types, so we map down to the shared inner `NetState` in each arm.
+        let device_state = match &mut microvm_state.device_states.virtio_state {
+            VirtioDevicesState::Mmio(mmio_state) => mmio_state
+                .net_devices
+                .iter_mut()
+                .map(|device| &mut device.device_state)
+                .find(|x| x.id == entry.iface_id),
+            VirtioDevicesState::Pci(pci_state) => pci_state
+                .net_devices
+                .iter_mut()
+                .map(|device| &mut device.device_state)
+                .find(|x| x.id == entry.iface_id),
+        };
+        device_state
             .map(|device_state| device_state.tap_if_name.clone_from(&entry.host_dev_name))
             .ok_or(SnapshotStateFromFileError::UnknownNetworkDevice)?;
     }
@@ -386,21 +406,17 @@ pub fn restore_from_snapshot(
     if let Some(vsock_override) = &params.vsock_override {
         // There should only ever be at most one vsock device, therefore this
         // should correctly find it and modify the path if such a device exists.
-        let device_state = microvm_state
-            .device_states
-            .mmio_state
-            .vsock_device
-            .as_mut()
-            .map(|device| &mut device.device_state)
-            .or_else(|| {
-                microvm_state
-                    .device_states
-                    .pci_state
-                    .vsock_device
-                    .as_mut()
-                    .map(|device| &mut device.device_state)
-            })
-            .ok_or(SnapshotStateFromFileError::UnknownVsockDevice)?;
+        let device_state = match &mut microvm_state.device_states.virtio_state {
+            VirtioDevicesState::Mmio(mmio_state) => mmio_state
+                .vsock_device
+                .as_mut()
+                .map(|device| &mut device.device_state),
+            VirtioDevicesState::Pci(pci_state) => pci_state
+                .vsock_device
+                .as_mut()
+                .map(|device| &mut device.device_state),
+        }
+        .ok_or(SnapshotStateFromFileError::UnknownVsockDevice)?;
 
         device_state
             .backend
@@ -424,7 +440,7 @@ pub fn restore_from_snapshot(
             smt: Some(microvm_state.vm_info.smt),
             cpu_template: Some(microvm_state.vm_info.cpu_template),
             track_dirty_pages: Some(track_dirty_pages),
-            huge_pages: Some(microvm_state.vm_info.huge_pages),
+            huge_pages: Some(params.huge_pages.resolve(microvm_state.vm_info.huge_pages)),
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
         })
@@ -445,8 +461,13 @@ pub fn restore_from_snapshot(
                 .into());
             }
             (
-                guest_memory_from_file(mem_backend_path, mem_state, track_dirty_pages)
-                    .map_err(RestoreFromSnapshotGuestMemoryError::File)?,
+                guest_memory_from_file(
+                    mem_backend_path,
+                    mem_state,
+                    track_dirty_pages,
+                    vm_resources.machine_config.huge_pages,
+                )
+                .map_err(RestoreFromSnapshotGuestMemoryError::File)?,
                 None,
             )
         }
@@ -508,9 +529,11 @@ fn guest_memory_from_file(
     mem_file_path: &Path,
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
+    huge_pages: HugePageConfig,
 ) -> Result<Vec<GuestRegionMmap>, GuestMemoryFromFileError> {
     let mem_file = File::open(mem_file_path)?;
-    let guest_mem = memory::snapshot_file(mem_file, mem_state.regions(), track_dirty_pages)?;
+    let guest_mem =
+        memory::snapshot_file(mem_file, mem_state.regions(), track_dirty_pages, huge_pages)?;
     Ok(guest_mem)
 }
 
@@ -651,6 +674,7 @@ mod tests {
     use crate::builder::tests::insert_vmclock_device;
     #[cfg(target_arch = "x86_64")]
     use crate::builder::tests::insert_vmgenid_device;
+    use crate::builder::tests::default_vmm_with_pci;
     use crate::builder::tests::{
         CustomBlockConfig, default_kernel_cmdline, default_vmm, insert_balloon_device,
         insert_block_devices, insert_net_device, insert_vsock_device,
@@ -695,6 +719,7 @@ mod tests {
             iface_id: String::from("netif"),
             host_dev_name: String::from("hostname"),
             guest_mac: None,
+            mtu: None,
             rx_rate_limiter: None,
             tx_rate_limiter: None,
         };
@@ -727,10 +752,13 @@ mod tests {
 
         // Only checking that all devices are saved, actual device state
         // is tested by that device's tests.
-        assert_eq!(states.mmio_state.block_devices.len(), 1);
-        assert_eq!(states.mmio_state.net_devices.len(), 1);
-        assert!(states.mmio_state.vsock_device.is_some());
-        assert!(states.mmio_state.balloon_device.is_some());
+        let VirtioDevicesState::Mmio(mmio_state) = &states.virtio_state else {
+            panic!("expected MMIO virtio device state");
+        };
+        assert_eq!(mmio_state.block_devices.len(), 1);
+        assert_eq!(mmio_state.net_devices.len(), 1);
+        assert!(mmio_state.vsock_device.is_some());
+        assert!(mmio_state.balloon_device.is_some());
 
         let vcpu_states = vec![VcpuState::default()];
         #[cfg(target_arch = "aarch64")]
@@ -744,9 +772,9 @@ mod tests {
                 ..Default::default()
             },
             #[cfg(target_arch = "aarch64")]
-            vm_state: vmm.vm.save_state(&mpidrs).unwrap(),
+            vm_state: vmm.vm.as_kvm().unwrap().save_state(&mpidrs).unwrap(),
             #[cfg(target_arch = "x86_64")]
-            vm_state: vmm.vm.save_state().unwrap(),
+            vm_state: vmm.vm.as_kvm().unwrap().save_state().unwrap(),
         };
 
         let serialized_data = bitcode::serialize(&microvm_state).unwrap();
@@ -754,20 +782,24 @@ mod tests {
         let restored_microvm_state: MicrovmState = bitcode::deserialize(&serialized_data).unwrap();
 
         assert_eq!(restored_microvm_state.vm_info, microvm_state.vm_info);
-        assert_eq!(
-            restored_microvm_state.device_states.mmio_state,
-            microvm_state.device_states.mmio_state
-        )
+        let (VirtioDevicesState::Mmio(restored_mmio), VirtioDevicesState::Mmio(mmio)) = (
+            &restored_microvm_state.device_states.virtio_state,
+            &microvm_state.device_states.virtio_state,
+        ) else {
+            panic!("expected MMIO virtio device state");
+        };
+        assert_eq!(restored_mmio, mmio)
     }
 
     #[test]
     fn test_save_state_rejects_when_vfio_attached() {
-        let mut vmm = default_vmm();
+        let mut vmm = default_vmm_with_pci();
         // Simulate an attached VFIO device by pushing a host BDF directly.
         // We don't go through attach_pci_vfio_device because that requires
         // real /dev/vfio/* fds.
         vmm.device_manager
-            .pci_devices
+            .pci_devices_mut()
+            .unwrap()
             .vfio_host_bdfs
             .push("0000:01:00.0".to_string());
 
@@ -789,13 +821,15 @@ mod tests {
 
     #[test]
     fn test_save_state_rejects_lists_all_vfio_bdfs() {
-        let mut vmm = default_vmm();
+        let mut vmm = default_vmm_with_pci();
         vmm.device_manager
-            .pci_devices
+            .pci_devices_mut()
+            .unwrap()
             .vfio_host_bdfs
             .push("0000:01:00.0".to_string());
         vmm.device_manager
-            .pci_devices
+            .pci_devices_mut()
+            .unwrap()
             .vfio_host_bdfs
             .push("0000:03:00.1".to_string());
 

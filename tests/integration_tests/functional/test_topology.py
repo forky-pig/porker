@@ -194,7 +194,7 @@ def _check_cache_topology_arm(test_microvm, no_cpus, kernel_version_tpl):
 
 @pytest.mark.parametrize("num_vcpus", [1, 2, 16])
 @pytest.mark.parametrize("htt", [True, False], ids=["HTT_ON", "HTT_OFF"])
-def test_cpu_topology(uvm_plain_any, num_vcpus, htt):
+def test_cpu_topology(uvm, num_vcpus, htt):
     """
     Check the CPU topology for a microvm with the specified config.
     """
@@ -206,7 +206,7 @@ def test_cpu_topology(uvm_plain_any, num_vcpus, htt):
     if version.parse(get_kernel_version()) >= version.parse("6.14"):
         pytest.skip("Starting on 6.14 KVM exposes a different CPU cache hierarchy")
 
-    vm = uvm_plain_any
+    vm = uvm
     vm.spawn()
     vm.basic_config(vcpu_count=num_vcpus, smt=htt)
     vm.add_net_iface()
@@ -217,15 +217,24 @@ def test_cpu_topology(uvm_plain_any, num_vcpus, htt):
     )
 
 
+@pytest.mark.skipif(
+    (6, 3) <= global_props.host_linux_version_tpl
+    and global_props.host_linux_version_tpl < (6, 10)
+    and PLATFORM == "aarch64",
+    reason="""On the range [6.3..6.10) of host kernels on aarch64 platform, the
+    cache topology provided by DT and CRIDR_EL1 register do not match. In that
+    case guest uses values from CLIDR_EL1 which will not contain info about L1$
+    and so this test will fail.""",
+)
 @pytest.mark.parametrize("num_vcpus", [1, 2, 16])
 @pytest.mark.parametrize("htt", [True, False], ids=["HTT_ON", "HTT_OFF"])
-def test_cache_topology(uvm_plain_any, num_vcpus, htt):
+def test_cache_topology(uvm, num_vcpus, htt):
     """
     Check the cache topology for a microvm with the specified config.
     """
     if htt and PLATFORM == "aarch64":
         pytest.skip("SMT is configurable only on x86.")
-    vm = uvm_plain_any
+    vm = uvm
     vm.spawn()
     vm.basic_config(vcpu_count=num_vcpus, smt=htt)
     vm.add_net_iface()

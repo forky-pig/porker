@@ -42,6 +42,16 @@ need careful merge.
 `src/vmm/src/builder.rs`. Upstream edits the build path frequently. We
 added VFIO setup pre-seccomp. Conflicts likely on most non-trivial syncs.
 
+`src/vmm/src/vstate/interrupts.rs` and `src/vmm/src/vstate/vm.rs`. The MSI-X
+vector API and the KVM VM handle. `VfioPciDevice` programs MSI/MSI-X routes
+through these; upstream reshaped both in 1.16/1.17 (`MsixVectorConfig` ->
+`MsixTableEntry`, `Vm` -> `KvmVm`). Semantic, not just textual: check how
+masked vectors are treated (see the MSI-X note in the changelog).
+
+`src/vmm/src/device_manager/mod.rs`. How the device manager exposes PCI
+state (`VirtioDevices` enum since 1.17). The VFIO attach loop in the builder
+and the snapshot check in `lib.rs` reach `PciDevices` through it.
+
 ### Medium risk
 
 `src/vmm/src/rpc_interface.rs`. We add VFIO API endpoints and the
@@ -67,17 +77,48 @@ trait shape (medium-risk above) but the file itself doesn't conflict.
 
 ## Merge process
 
-When pulling an upstream change:
+What worked for the v1.17.0 sync (0.1.1); repeat it.
 
-1. Cherry-pick or merge into a `sync/upstream-<sha>` branch off `main`.
-2. Run `cargo build` and exercise the VFIO path on real hardware (a NIC
-   VF is the cheapest signal; a GPU is the heavier one).
-3. If the change touches a high-risk file, walk the conflict by hand;
-   don't trust automatic merge.
-4. If the change touches the seccomp filter, regenerate and confirm the
-   VFIO smoke test still passes through jailer.
-5. PR into `main`. Update this file's drift surface section if a new
-   conflict zone shows up.
+1. `git fetch origin` (upstream). Pick checkpoints: the fork points of
+   upstream's release tags on `main` (the tag itself if it is one commit
+   off `main`). Branch `sync/upstream-<tag>` off the Porker branch
+   (`porker-internal` in the development fork; `main` in porker-vmm/porker
+   only ever receives snapshots, see "Publishing" below).
+2. Per checkpoint: `git merge --no-ff <commit>`. Stripped CI stays deleted,
+   including *new* files upstream adds under `.buildkite/`. `README.md` is
+   Porker's. `CHANGELOG.md` keeps the Porker sections on top. Walk every
+   drift-surface conflict by hand; expect compile-level adaptation in
+   `vfio_pci.rs` even where there is no textual conflict.
+3. Build: `cargo build --release -p firecracker -p jailer`. The workspace's
+   `default-members` excludes the jailer, so a plain `cargo build` leaves a
+   stale jailer binary. `cargo clippy` too (install the clippy component
+   for the new toolchain first).
+4. Unit tests, twice: `RUST_TEST_THREADS=1 cargo test -p vmm -p jailer
+   --no-fail-fast` on the merge and on pure upstream at the same commit.
+   The two failure sets must be identical. Upstream runs single-threaded;
+   dozens of tests assert on global metrics and flake in parallel. TAP tests
+   need root. Some failures are host-specific and permanent (pmem/virtio-mem
+   on 39-bit CPUs), which is why the comparison is against upstream and not
+   against zero.
+5. Boot smoke: a plain guest to login over virtio-mmio and again with
+   `--enable-pci`, then a clean SIGTERM exit.
+6. Hardware: `sudo tools/porker_hw_round.sh all` (GPU: M3 stability, 3
+   boots + teardown; NIC: M1, guest driver binds the card). Its header lists
+   the traps it works around; do not reinvent them.
+7. Commit the merge with the resolution in the message. Bump
+   `PORKER_FORK_BASE` (firecracker and jailer `main.rs`). Fast-forward the
+   Porker branch, push.
+8. Update this file's "Currently tracked upstream base" and the changelog,
+   then publish.
+
+## Publishing
+
+porker-vmm/porker is publish-only: a single squashed snapshot per release,
+never edited directly (edits made there have to be back-ported here first).
+`tools/publish_snapshot.sh` copies the tagged internal tree over the public
+checkout minus the strip list (`tools/publish_strip.txt`), leaving one
+commit and one tag for review and push. Merge commits cannot be mirrored
+with `tools/mirror_to_porker.sh`; that script is for single commits only.
 
 ## What Porker doesn't take from upstream
 
@@ -90,9 +131,10 @@ When pulling an upstream change:
 
 ## Currently tracked upstream base
 
-Fork base SHA: `a481d51d0` (the upstream FC commit Porker forked from).
-This is what `firecracker --version` reports.
+Fork base SHA: `95f868c8e` = Firecracker **v1.17.0** (2026-09-04). This is
+what `firecracker --version` reports.
 
-Last upstream sync: at fork time. None since. v0.1.0 is the initial
-release; subsequent releases will record the last-synced upstream SHA
-here.
+Last upstream sync: 2026-09-13, Porker 0.1.1. Two merge commits:
+`88955789c` (upstream main at the v1.16.0 cut, `e90cef8b6`) and `4440262d9`
+(the v1.17.0 tag). The original fork point was `a481d51d0` (2026-04-14),
+which 0.1.0 shipped on.

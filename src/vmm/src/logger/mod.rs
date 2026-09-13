@@ -103,28 +103,10 @@ macro_rules! __log_rate_limited_impl {
     ($level:expr, $level_macro:path, $($arg:tt)+) => {{
         #[allow(clippy::disallowed_macros)]
         if $crate::logger::log_enabled!($level) {
-            static LIMITER: $crate::logger::rate_limited::LogRateLimiter =
-                $crate::logger::rate_limited::LogRateLimiter::new(
-                    $crate::logger::rate_limited::DEFAULT_BURST,
-                    $crate::logger::rate_limited::DEFAULT_REFILL_TIME_MS,
-                );
-            static SUPPRESSED: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-
-            if LIMITER.check() {
-                let suppressed =
-                    SUPPRESSED.swap(0, std::sync::atomic::Ordering::Relaxed);
-                if suppressed > 0 {
-                    $crate::warn_unrestricted!(
-                        "{suppressed} messages were suppressed due to rate limiting"
-                    );
-                }
+            static LIMITER: $crate::logger::rate_limited::DefaultLogRateLimiter =
+                $crate::logger::rate_limited::DefaultLogRateLimiter::new();
+            if LIMITER.check_maybe_suppressed() {
                 $level_macro!($($arg)+);
-            } else {
-                SUPPRESSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                $crate::logger::IncMetric::inc(
-                    &$crate::logger::METRICS.logger.rate_limited_log_count,
-                );
             }
         }
     }};

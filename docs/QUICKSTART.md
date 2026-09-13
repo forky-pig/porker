@@ -75,7 +75,7 @@ ls /dev/vfio/
 ## Minimal config
 
 You need a guest kernel and rootfs. For the guest cmdline, include
-`pci=realloc=off` (ResizableBAR is disabled in v0.1.0).
+`pci=realloc=off` (ResizableBAR is disabled in v0.1.x).
 
 The Porker API is HTTP-over-Unix-socket. Sequence:
 

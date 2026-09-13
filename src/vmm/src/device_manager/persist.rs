@@ -10,8 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::acpi::ACPIDeviceManager;
 use super::mmio::*;
-#[cfg(target_arch = "aarch64")]
-use crate::arch::DeviceType;
+use crate::EventManager;
 use crate::device_manager::DevicePersistError;
 use crate::device_manager::acpi::ACPIDeviceError;
 use crate::devices::acpi::vmclock::{VmClock, VmClockState};
@@ -37,13 +36,12 @@ use crate::devices::virtio::vsock::persist::{
     VsockConstructorArgs, VsockState, VsockUdsConstructorArgs,
 };
 use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
-use crate::logger::warn;
 use crate::mmds::data_store::MmdsVersion;
 use crate::resources::VmResources;
 use crate::snapshot::Persist;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vstate::memory::GuestMemoryMmap;
-use crate::{EventManager, Vm};
+use crate::vstate::vm::KvmVm;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SerialState {
@@ -106,28 +104,15 @@ pub struct VirtioDeviceState<T> {
     pub device_info: MMIODeviceInfo,
 }
 
-/// Holds the state of a legacy device connected to the MMIO space.
-#[cfg(target_arch = "aarch64")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConnectedLegacyState {
-    /// Device identifier.
-    pub type_: DeviceType,
-    /// VmmResources.
-    pub device_info: MMIODeviceInfo,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MmdsState {
     pub version: MmdsVersion,
     pub imds_compat: bool,
 }
 
-/// Holds the device states.
+/// Holds the states of the virtio devices connected over the MMIO transport.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct DeviceStates {
-    #[cfg(target_arch = "aarch64")]
-    // State of legacy devices in MMIO space.
-    pub legacy_devices: Vec<ConnectedLegacyState>,
     /// Block device states.
     pub block_devices: Vec<VirtioDeviceState<BlockState>>,
     /// Net device states.
@@ -148,12 +133,29 @@ pub struct DeviceStates {
 
 pub struct MMIODevManagerConstructorArgs<'a> {
     pub mem: &'a GuestMemoryMmap,
-    pub vm: &'a Arc<Vm>,
+    pub vm: &'a Arc<KvmVm>,
     pub event_manager: &'a mut EventManager,
     pub vm_resources: &'a mut VmResources,
     pub instance_id: &'a str,
+}
+
+pub struct MMIOPlatformDevicesConstructorArgs<'a> {
+    pub vm: &'a Arc<KvmVm>,
+    pub event_manager: &'a mut EventManager,
+    pub vm_resources: &'a mut VmResources,
     pub serial_state: Option<&'a SerialState>,
 }
+
+impl fmt::Debug for MMIOPlatformDevicesConstructorArgs<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MMIOPlatformDevicesConstructorArgs")
+            .field("vm", &self.vm)
+            .field("event_manager", &"?")
+            .field("vm_resources", &self.vm_resources)
+            .finish()
+    }
+}
+
 impl fmt::Debug for MMIODevManagerConstructorArgs<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MMIODevManagerConstructorArgs")
@@ -173,9 +175,20 @@ pub struct ACPIDeviceManagerState {
     vmclock: VmClockState,
 }
 
+/// Holds the states of the non-virtio (platform) devices connected over the MMIO transport.
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+pub struct MMIOPlatformDevicesState {
+    #[cfg(target_arch = "aarch64")]
+    /// State of the serial device in MMIO space.
+    pub serial: Option<MMIODeviceInfo>,
+    #[cfg(target_arch = "aarch64")]
+    /// State of the RTC device in MMIO space.
+    pub rtc: Option<MMIODeviceInfo>,
+}
+
 impl<'a> Persist<'a> for ACPIDeviceManager {
     type State = ACPIDeviceManagerState;
-    type ConstructorArgs = &'a Vm;
+    type ConstructorArgs = &'a KvmVm;
     type Error = ACPIDeviceError;
 
     fn save(&self) -> Self::State {
@@ -187,11 +200,11 @@ impl<'a> Persist<'a> for ACPIDeviceManager {
 
     fn restore(vm: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
         let mut acpi_devices = ACPIDeviceManager::new(
-            // Safe to unwrap() here, this will never return an error.
-            VmGenId::restore((), &state.vmgenid).unwrap(),
-            // Safe to unwrap() here, this will never return an error.
-            VmClock::restore((), &state.vmclock).unwrap(),
+            VmGenId::restore((), &state.vmgenid)?,
+            VmClock::restore((), &state.vmclock)?,
         );
+
+        acpi_devices.replay_gsi_allocations(vm)?;
 
         acpi_devices.activate_vmgenid(vm)?;
         acpi_devices.do_post_restore_vmgenid()?;
@@ -203,30 +216,63 @@ impl<'a> Persist<'a> for ACPIDeviceManager {
     }
 }
 
-impl<'a> Persist<'a> for MMIODeviceManager {
+impl<'a> Persist<'a> for MMIOPlatformDevices {
+    type State = MMIOPlatformDevicesState;
+    type ConstructorArgs = MMIOPlatformDevicesConstructorArgs<'a>;
+    type Error = DevicePersistError;
+
+    fn save(&self) -> Self::State {
+        MMIOPlatformDevicesState {
+            #[cfg(target_arch = "aarch64")]
+            serial: self.serial.as_ref().map(|device| device.resources),
+            #[cfg(target_arch = "aarch64")]
+            rtc: self.rtc.as_ref().map(|device| device.resources),
+        }
+    }
+
+    #[allow(unused_variables)]
+    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_mut))]
+    fn restore(
+        constructor_args: Self::ConstructorArgs,
+        state: &Self::State,
+    ) -> Result<Self, Self::Error> {
+        let mut platform_devices = MMIOPlatformDevices::new();
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            if let Some(device_info) = state.serial {
+                let serial_state = constructor_args.serial_state.map(Into::into);
+                let serial = crate::DeviceManager::setup_serial_device(
+                    constructor_args.event_manager,
+                    constructor_args.vm_resources.serial_out_path.as_ref(),
+                    serial_state.as_ref(),
+                    constructor_args.vm_resources.serial_rate_limiter(),
+                )?;
+
+                platform_devices.register_mmio_serial(
+                    constructor_args.vm,
+                    serial,
+                    Some(device_info),
+                )?;
+            }
+
+            if let Some(device_info) = state.rtc {
+                let rtc = Arc::new(Mutex::new(RTCDevice::new()));
+                platform_devices.register_mmio_rtc(constructor_args.vm, rtc, Some(device_info))?;
+            }
+        }
+
+        Ok(platform_devices)
+    }
+}
+
+impl<'a> Persist<'a> for MMIOVirtioDevices {
     type State = DeviceStates;
     type ConstructorArgs = MMIODevManagerConstructorArgs<'a>;
     type Error = DevicePersistError;
 
     fn save(&self) -> Self::State {
         let mut states = DeviceStates::default();
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            if let Some(device) = &self.serial {
-                states.legacy_devices.push(ConnectedLegacyState {
-                    type_: DeviceType::Serial,
-                    device_info: device.resources,
-                });
-            }
-
-            if let Some(device) = &self.rtc {
-                states.legacy_devices.push(ConnectedLegacyState {
-                    type_: DeviceType::Rtc,
-                    device_info: device.resources,
-                });
-            }
-        }
 
         let _: Result<(), ()> = self.for_each_virtio_mmio_device(|_, devid, device| {
             let mmio_transport_locked = device.inner.lock().expect("Poisoned lock");
@@ -256,20 +302,17 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 // Both virtio-block and vhost-user-block share same device type.
                 VirtioDeviceType::Block => {
                     let block = locked_device.as_mut_any().downcast_mut::<Block>().unwrap();
-                    if block.is_vhost_user() {
-                        warn!(
-                            "Skipping vhost-user-block device. VhostUserBlock does not support \
-                             snapshotting yet"
-                        );
-                    } else {
-                        let device_state = block.save();
-                        states.block_devices.push(VirtioDeviceState {
-                            device_id,
-                            device_state,
-                            transport_state,
-                            device_info,
-                        });
-                    }
+                    assert!(
+                        !block.is_vhost_user(),
+                        "vhost-user-block does not support snapshotting yet"
+                    );
+                    let device_state = block.save();
+                    states.block_devices.push(VirtioDeviceState {
+                        device_id,
+                        device_state,
+                        transport_state,
+                        device_info,
+                    });
                 }
                 VirtioDeviceType::Net => {
                     let net = locked_device.as_mut_any().downcast_mut::<Net>().unwrap();
@@ -359,31 +402,9 @@ impl<'a> Persist<'a> for MMIODeviceManager {
         constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
-        let mut dev_manager = MMIODeviceManager::new();
+        let mut dev_manager = MMIOVirtioDevices::new();
         let mem = constructor_args.mem;
         let vm = constructor_args.vm;
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            for state in &state.legacy_devices {
-                if state.type_ == DeviceType::Serial {
-                    let serial_state: Option<vm_superio::serial::SerialState> =
-                        constructor_args.serial_state.map(Into::into);
-                    let serial = crate::DeviceManager::setup_serial_device(
-                        constructor_args.event_manager,
-                        constructor_args.vm_resources.serial_out_path.as_ref(),
-                        serial_state.as_ref(),
-                        constructor_args.vm_resources.serial_rate_limiter(),
-                    )?;
-
-                    dev_manager.register_mmio_serial(vm, serial, Some(state.device_info))?;
-                }
-                if state.type_ == DeviceType::Rtc {
-                    let rtc = Arc::new(Mutex::new(RTCDevice::new()));
-                    dev_manager.register_mmio_rtc(vm, rtc, Some(state.device_info))?;
-                }
-            }
-        }
 
         let mut restore_helper = |device: Arc<Mutex<dyn VirtioDevice>>,
                                   activated: bool,
@@ -404,6 +425,10 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 MmioTransport::restore(restore_args, state)
                     .map_err(|()| DevicePersistError::MmioTransport)?,
             ));
+
+            vm.resource_allocator()
+                .gsi_legacy_allocator
+                .allocate_id_at(device_info.gsi.ok_or(MmioError::InvalidIrqConfig)?)?;
 
             dev_manager.register_mmio_virtio(
                 vm,
@@ -566,7 +591,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
             let device = Arc::new(Mutex::new(Pmem::restore(
                 PmemConstructorArgs {
                     mem,
-                    vm: vm.as_ref(),
+                    vm: vm.clone(),
                 },
                 &pmem_state.device_state,
             )?));
@@ -574,7 +599,8 @@ impl<'a> Persist<'a> for MMIODeviceManager {
             constructor_args
                 .vm_resources
                 .pmem
-                .add_device(device.clone());
+                .configs
+                .push(pmem_state.device_state.config.clone());
 
             restore_helper(
                 device,
@@ -654,8 +680,8 @@ mod tests {
         }
     }
 
-    impl PartialEq for MMIODeviceManager {
-        fn eq(&self, other: &MMIODeviceManager) -> bool {
+    impl PartialEq for MMIOVirtioDevices {
+        fn eq(&self, other: &MMIOVirtioDevices) -> bool {
             // We only care about the device hashmap.
             if self.virtio_devices.len() != other.virtio_devices.len() {
                 return false;
@@ -667,7 +693,7 @@ mod tests {
                 }
             }
 
-            self.boot_timer == other.boot_timer
+            true
         }
     }
 
@@ -711,6 +737,7 @@ mod tests {
                 iface_id: String::from("netif"),
                 host_dev_name: String::from("hostname"),
                 guest_mac: None,
+                mtu: None,
                 rx_rate_limiter: None,
                 tx_rate_limiter: None,
             };
@@ -739,6 +766,7 @@ mod tests {
                 path_on_host: "".into(),
                 root_device: true,
                 read_only: true,
+                ..Default::default()
             }];
             _pmem_files =
                 insert_pmem_devices(&mut vmm, &mut cmdline, &mut event_manager, pmem_configs);
@@ -765,17 +793,21 @@ mod tests {
         let vmm = default_vmm();
         let device_manager_state: device_manager::DevicesState =
             bitcode::deserialize(&serialized_data).unwrap();
+        let device_manager::VirtioDevicesState::Mmio(mmio_state) =
+            &device_manager_state.virtio_state
+        else {
+            panic!("expected MMIO virtio device state");
+        };
         let vm_resources = &mut VmResources::default();
+        let kvm_vm = vmm.vm.as_kvm().unwrap().clone();
         let restore_args = MMIODevManagerConstructorArgs {
-            mem: vmm.vm.guest_memory(),
-            vm: &vmm.vm,
+            mem: kvm_vm.guest_memory(),
+            vm: &kvm_vm,
             event_manager: &mut event_manager,
             vm_resources,
             instance_id: "microvm-id",
-            serial_state: None,
         };
-        let _restored_dev_manager =
-            MMIODeviceManager::restore(restore_args, &device_manager_state.mmio_state).unwrap();
+        let _restored_dev_manager = MMIOVirtioDevices::restore(restore_args, mmio_state).unwrap();
 
         let expected_vm_resources = format!(
             r#"{{
@@ -793,9 +825,17 @@ mod tests {
       "is_root_device": true,
       "cache_type": "Unsafe",
       "is_read_only": true,
+      "discard": false,
       "path_on_host": "{}",
       "rate_limiter": null,
       "io_engine": "Sync",
+      "blk_size": 512,
+      "topology": {{
+        "physical_block_exp": 0,
+        "alignment_offset": 0,
+        "min_io_size": 0,
+        "opt_io_size": 128
+      }},
       "socket": null
     }}
   ],
@@ -827,6 +867,7 @@ mod tests {
       "iface_id": "netif",
       "host_dev_name": "hostname",
       "guest_mac": null,
+      "mtu": null,
       "rx_rate_limiter": null,
       "tx_rate_limiter": null
     }}
@@ -843,7 +884,8 @@ mod tests {
       "id": "pmem",
       "path_on_host": "{}",
       "root_device": true,
-      "read_only": true
+      "read_only": true,
+      "rate_limiter": null
     }}
   ],
   "memory-hotplug": {{
@@ -867,10 +909,7 @@ mod tests {
                 .version(),
             MmdsVersion::V2
         );
-        assert_eq!(
-            device_manager_state.mmio_state.mmds.unwrap().version,
-            MmdsVersion::V2
-        );
+        assert_eq!(mmio_state.mmds.as_ref().unwrap().version, MmdsVersion::V2);
         assert_eq!(
             expected_vm_resources,
             serde_json::to_string_pretty(&VmmConfig::from(&*vm_resources)).unwrap()

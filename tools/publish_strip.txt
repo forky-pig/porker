@@ -1,0 +1,36 @@
+# Paths removed from the porker-vmm/porker snapshot (see tools/publish_snapshot.sh).
+# One path or shell glob per line, relative to the repo root; trailing '/' = whole directory.
+# Rule of thumb: Porker-internal milestone notes, proof logs and lab-only tooling stay
+# internal; anything that is upstream Firecracker's own file, or that a user of the public
+# repo needs to reproduce our hardware gate, is published.
+
+# milestone notes and proof logs
+fc_vfio_*.log
+guest_m3.txt
+milestone_*.txt
+milestone_*.md
+possible_multiple_bdf.txt
+project_m4_milestone.md
+the_plan.txt
+
+# lab-only tooling (the M4 CUDA battery, M2 probes, rootfs staging for the lab machine)
+tools/debug_vfio_ioctls.py
+tools/m4_kernels/
+tools/m4_run_battery.sh
+tools/m4_stage_rootfs.sh
+tools/test_vfio_m1.py.stock
+tools/test_vfio_m2.py
+tools/test_vfio_m2_guest_probe.sh
+tools/test_vfio_m2_proof.py
+tools/test_vfio_m3.py
+tools/test_vfio_m3_guest_probe.sh
+tools/test_vfio_m4_proof.py
+tools/test_vfio_m4_teardown.py
+tools/vecadd.cu
+
+# internal workflow (hard-codes the maintainer's checkout paths)
+tools/mirror_to_porker.sh
+
+# Published on purpose (listed here so nobody "cleans them up"):
+#   tools/porker_hw_round.sh, tools/test_vfio_m1.py, tools/test_vfio_m3_proof.py  -- the hardware gate
+#   src/vmm/src/test_utils/mock_resources/*.bin                                  -- upstream's own test fixtures

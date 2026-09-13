@@ -6,7 +6,7 @@ use std::fs::File;
 use std::os::fd::RawFd;
 use std::os::unix::io::AsRawFd;
 
-use vm_memory::GuestMemoryError;
+use vm_memory::{GuestMemoryBackend, GuestMemoryError};
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::devices::virtio::block::virtio::io::RequestError;
@@ -15,10 +15,12 @@ use crate::io_uring::operation::{Cqe, OpCode, Operation};
 use crate::io_uring::restriction::Restriction;
 use crate::io_uring::{IoUring, IoUringError};
 use crate::logger::log_dev_preview_warning;
-use crate::vstate::memory::{GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap};
+use crate::vstate::memory::{GuestAddress, GuestMemoryExtension, GuestMemoryMmap};
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum AsyncIoError {
+    /// Not implemented
+    NotImplemented,
     /// IO: {0}
     IO(std::io::Error),
     /// IoUring: {0}
@@ -110,7 +112,6 @@ impl AsyncFileEngine {
         Ok(())
     }
 
-    #[cfg(test)]
     pub fn file(&self) -> &File {
         &self.file
     }
@@ -196,6 +197,10 @@ impl AsyncFileEngine {
                 req: data.req,
                 error: AsyncIoError::IoUring(io_uring_error),
             })
+    }
+
+    pub fn discard(&mut self, _range: (u64, u32)) -> Result<u32, AsyncIoError> {
+        Err(AsyncIoError::NotImplemented)
     }
 
     pub fn kick_submission_queue(&mut self) -> Result<(), AsyncIoError> {

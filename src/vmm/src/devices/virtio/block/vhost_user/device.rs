@@ -25,7 +25,7 @@ use crate::devices::virtio::vhost_user::{VhostUserHandleBackend, VhostUserHandle
 use crate::devices::virtio::vhost_user_metrics::{
     VhostUserDeviceMetrics, VhostUserMetricsPerDevice,
 };
-use crate::logger::{IncMetric, StoreMetric, error, log_dev_preview_warning};
+use crate::logger::{IncMetric, StoreMetric, log_dev_preview_warning};
 use crate::utils::u64_to_usize;
 use crate::vmm_config::drive::BlockDeviceConfig;
 use crate::vstate::memory::GuestMemoryMmap;
@@ -67,12 +67,15 @@ impl TryFrom<&BlockDeviceConfig> for VhostUserBlockConfig {
     type Error = VhostUserBlockError;
 
     fn try_from(value: &BlockDeviceConfig) -> Result<Self, Self::Error> {
-        if let (Some(socket), None, None, None, None) = (
+        if let (Some(socket), None, None, None, None, None, None, None) = (
             &value.socket,
             &value.is_read_only,
+            &value.discard,
             &value.path_on_host,
             &value.rate_limiter,
             &value.file_engine_type,
+            &value.blk_size,
+            &value.topology,
         ) {
             Ok(Self {
                 drive_id: value.drive_id.clone(),
@@ -97,9 +100,12 @@ impl From<VhostUserBlockConfig> for BlockDeviceConfig {
             cache_type: value.cache_type,
 
             is_read_only: None,
+            discard: None,
             path_on_host: None,
             rate_limiter: None,
             file_engine_type: None,
+            blk_size: None,
+            topology: None,
 
             socket: Some(value.socket),
         }
@@ -328,14 +334,8 @@ where
             .deref()
     }
 
-    fn read_config(&self, offset: u64, data: &mut [u8]) {
-        if let Some(config_space_bytes) = self.config_space.as_slice().get(u64_to_usize(offset)..) {
-            let len = config_space_bytes.len().min(data.len());
-            data[..len].copy_from_slice(&config_space_bytes[..len]);
-        } else {
-            error!("Failed to read config space");
-            self.metrics.cfg_fails.inc();
-        }
+    fn config_as_bytes(&self) -> &[u8] {
+        self.config_space.as_slice()
     }
 
     fn write_config(&mut self, _offset: u64, _data: &[u8]) {
@@ -349,6 +349,8 @@ where
         mem: GuestMemoryMmap,
         interrupt: Arc<dyn VirtioInterrupt>,
     ) -> Result<(), ActivateError> {
+        assert!(!self.is_activated());
+
         for q in self.queues.iter_mut() {
             q.initialize(&mem)
                 .map_err(ActivateError::QueueMemoryError)?;
@@ -378,6 +380,14 @@ where
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+
+    fn deactivate(&mut self) {
+        self.device_state = DeviceState::Inactive;
+    }
+
+    fn _reset(&mut self) -> bool {
+        false
     }
 }
 
@@ -409,9 +419,12 @@ mod tests {
             cache_type: CacheType::Unsafe,
 
             is_read_only: None,
+            discard: None,
             path_on_host: None,
             rate_limiter: None,
             file_engine_type: None,
+            blk_size: None,
+            topology: None,
 
             socket: Some("sock".to_string()),
         };
@@ -424,9 +437,12 @@ mod tests {
             cache_type: CacheType::Unsafe,
 
             is_read_only: Some(true),
+            discard: None,
             path_on_host: Some("path".to_string()),
             rate_limiter: None,
             file_engine_type: Some(FileEngineType::Sync),
+            blk_size: None,
+            topology: None,
 
             socket: None,
         };
@@ -439,9 +455,12 @@ mod tests {
             cache_type: CacheType::Unsafe,
 
             is_read_only: Some(true),
+            discard: None,
             path_on_host: Some("path".to_string()),
             rate_limiter: None,
             file_engine_type: Some(FileEngineType::Sync),
+            blk_size: None,
+            topology: None,
 
             socket: Some("sock".to_string()),
         };

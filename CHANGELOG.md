@@ -9,6 +9,64 @@ and this project adheres to
 Porker entries are at the top under `## [Porker x.y.z]`. Upstream
 Firecracker entries follow.
 
+## [Porker 0.1.1] - 2026-09-13
+
+Upstream base moved from `a481d51d0` (April 2026) to Firecracker **v1.17.0**
+(`95f868c8e`). 531 upstream commits merged in two checkpoints (`88955789c`:
+main at the v1.16.0 cut; `4440262d9`: the v1.17.0 tag). Each checkpoint was
+gated on unit tests compared against pure upstream at the same commit, boot
+smoke over virtio-mmio and virtio-pci, and real-hardware passthrough of the
+RTX 4080 (M3 stability 3/3) and the RTL8111 (r8169 bound in the guest).
+
+### Changed
+
+- Rust toolchain 1.94.1 -> 1.97.0 (upstream's pin).
+- Upstream changes now in Porker include: virtio device reset, bzImage guest
+  kernels, transparent huge pages for guest memory, 6.18 guest kernel
+  support, virtio-blk discard/topology/block-size features, vsock RX fixes
+  (pause/resume, host-stream busy-spin), a logger deadlock fix, the KVM
+  CPUID-ordering fix for 6.13+ host kernels, memory-hotplug hardening.
+  The upstream sections below have the full list.
+- VFIO integration adapted to upstream refactors: the `KvmVm`/`Vm` split,
+  PCI segment created in `DeviceManager::new`, `PciDevices.pci_segment` no
+  longer optional, `MsixTableEntry` replacing `MsixVectorConfig`, BAR
+  allocation through the public address allocators, vm-memory 1.18. The
+  MSI-X enable path keeps Porker's semantics (every route registered, every
+  irqfd enabled) because the MSI-X table is direct-mapped into the guest.
+- The VFIO snapshot refusal now lives in upstream's
+  `check_unsnapshottable_devices()`.
+- vmm seccomp filter: union of upstream's new hotplug rules (ioeventfd,
+  irqfd, tap ioctls) and Porker's VFIO ioctls.
+- `firecracker --version` / `jailer --version` report the fork base
+  (`95f868c8e`) and the upstream version (`FC v1.17.0`).
+
+### Added
+
+- `tools/porker_hw_round.sh`: one-command hardware gate (GPU and/or NIC
+  passthrough against the release binary), run at every sync checkpoint.
+
+### Fixed
+
+- Jailer fd-closing loop and VFIO BAR-index filter had always-true bound
+  checks (clippy `absurd_extreme_comparisons`).
+- VFIO attach propagates PCI bus `add_device` errors instead of dropping
+  them.
+
+### Removed
+
+- Upstream's new FC-private CI files (`.buildkite/pipeline_sanitizers.py`,
+  `.buildkite/pipeline_upload.sh`), per the fork policy.
+
+### Known issues (pre-existing, now written down)
+
+- MSI-X vectors that are masked when the guest enables MSI-X get no KVM
+  route, and later unmasks are not observed because the table is
+  direct-mapped. Not hit by the RTL8111 or RTX 4080 paths tested.
+- Unit tests: pmem/virtio-mem tests place memory at 2^39 and cannot pass on
+  hosts with 39-bit physical addressing. Run the suite with
+  `RUST_TEST_THREADS=1` (upstream does) and compare failure sets against pure
+  upstream at the same commit; see `docs/UPSTREAM.md`.
+
 ## [Porker 0.1.0] - 2026-05-06
 
 Forked from Firecracker at `a481d51d0`. Adds VFIO PCI passthrough.
@@ -66,10 +124,170 @@ jailer alone. VFIO ioctls in seccomp. GPU firmware in the trust
 boundary. ACS required for safe P2P DMA. `docs/THREAT_MODEL.md` has the
 full list.
 
-## [Unreleased]
+## [1.17.0]
 
 ### Added
 
+- [#5891](https://github.com/firecracker-microvm/firecracker/pull/5891): Added
+  support for virtio device reset.
+- [#5983](https://github.com/firecracker-microvm/firecracker/pull/5983): Add two
+  optional metrics fields, set via `PUT /metrics` or a config file: `emit_id`
+  emits the microVM instance id under a top-level `id` field, and `properties`
+  emits operator-defined key-value pairs under a top-level `properties` field.
+  Each is opt-in and independent. See [metrics documentation](docs/metrics.md).
+- [#6003](https://github.com/firecracker-microvm/firecracker/pull/6003): Added a
+  new option `Transparent` for the `huge_pages` setting. If set, Firecracker
+  will use transparent huge pages for the guest memory via
+  `madvise(MADV_HUGEPAGE)`. Guest memory must be a multiple of 2MB when using
+  this option.
+- [#6013](https://github.com/firecracker-microvm/firecracker/pull/6013),
+  [#6017](https://github.com/firecracker-microvm/firecracker/pull/6017),
+  [#6021](https://github.com/firecracker-microvm/firecracker/pull/6021): Added
+  official support for 6.18 microVM guest kernels.
+- [#6037](https://github.com/firecracker-microvm/firecracker/pull/6037): Added
+  support for booting `bzImage` guest kernels on x86_64, in addition to the
+  existing uncompressed ELF (`vmlinux`) images. The kernel image format is
+  detected automatically, so no configuration change is required.
+- [#6064](https://github.com/firecracker-microvm/firecracker/pull/6064): Added
+  the `huge_pages` field to `PUT /snapshot/load`, allowing the restored microVM
+  to reuse the snapshot's host page configuration or select `None`,
+  `Transparent`, or `2M`.
+- [#6109](https://github.com/firecracker-microvm/firecracker/pull/6109): Added
+  an optional `sync_snapshot_files` field to the `PUT /snapshot/create` API,
+  defaulting to `true`. It controls whether the snapshot state and guest memory
+  files are synced to disk (`fsync`) before the request returns. Setting it to
+  `false` returns without waiting for the writeback, making snapshot creation
+  faster at the cost of durability across a host crash; the data stays in the
+  host page cache, so same-host reads still see the full contents. Block device
+  backing files are always `fsync`'d regardless. See
+  [snapshot documentation](docs/snapshotting/snapshot-support.md).
+- [#6116](https://github.com/firecracker-microvm/firecracker/pull/6116): On
+  aarch64, enable `KVM_CAP_ARM_WRITABLE_IMP_ID_REGS` when the host kernel offers
+  it (Linux 6.15 and later), adding support for custom CPU templates that modify
+  the implementation ID registers (`MIDR_EL1`, `REVIDR_EL1`, `AIDR_EL1`). Such
+  templates previously failed at boot with
+  `Failed to set register ... Invalid argument` because KVM rejects the write
+  unless the capability is enabled on the VM.
+- [#6145](https://github.com/firecracker-microvm/firecracker/pull/6145): Added
+  official support for AWS Graviton5 (m9g.metal-48xl) instances.
+- [#6098](https://github.com/firecracker-microvm/firecracker/pull/6098): Added
+  new VIRTIO_BLK_F_BLK_SIZE and VIRTIO_BLK_F_TOPOLOGY features to the
+  virtio-block device. More information is in the new [block](docs/block.md)
+  documentation.
+- [#6142](https://github.com/firecracker-microvm/firecracker/pull/6142): Add
+  opt-in virtio-blk discard support for writable `Sync` IO engine drives through
+  the `discard` drive configuration field. See the
+  [block discard documentation](docs/api_requests/block-discard.md).
+
+### Changed
+
+- [#6115](https://github.com/firecracker-microvm/firecracker/pull/6115): Changed
+  the T2S CPU template to set the `FB_CLEAR` bit of `MSR_IA32_ARCH_CAPABILITIES`
+  to 1. This lets guest kernels recognize that the `VERW` instruction clears
+  fill buffers, including on host kernels before v6.4 that cannot expose
+  `FLUSH_L1D`.
+- [#6172](https://github.com/firecracker-microvm/firecracker/pull/6172): Gate
+  CLIRD_EL1 override to only happen on host kernels equal or newer than 6.10
+  release. This aliviates the guest performance regression seen on host kernels
+  in range \[6.3..6.10) correlated to incorrect cpu cache topology presented to
+  the guest.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- [#6100](https://github.com/firecracker-microvm/firecracker/pull/6100): Fixed
+  the vsock device permanently suppressing RX (host-to-guest) delivery after a
+  bare pause/resume cycle (`PATCH /vm` with `Paused` then `Resumed`, without a
+  snapshot). The resume kick armed the `TRANSPORT_RESET` RX gate even though no
+  reset event had been sent, so the guest could never acknowledge it and every
+  new host-initiated connection made after the resume hung forever. The gate is
+  now part of the persisted device state and the resume kick respects it instead
+  of arming it.
+- [#6174](https://github.com/firecracker-microvm/firecracker/pull/6174): Fixed
+  `virtio-mem` leaving unplugged memory writable by the VMM, and potentially
+  unmapped, on microVMs restored from a snapshot memory file. Firecracker now
+  maps each slot straight to the protection it should have, with the
+  `MAP_NORESERVE` flag, and aborts if the re-map fails.
+- [#6174](https://github.com/firecracker-microvm/firecracker/pull/6174): Fixed
+  `virtio-mem` discarding the whole hotpluggable region on every `UNPLUG_ALL`
+  request, even when nothing was plugged. The discard is now skipped when the
+  range has no plugged blocks.
+- [#6176](https://github.com/firecracker-microvm/firecracker/pull/6176): Fixed
+  `virtio-mem` leaving its block accounting inconsistent with the KVM memory
+  slots if a plug or unplug request failed part way through. Firecracker now
+  commits each slot's state only after its KVM update succeeds, so a partial
+  failure leaves the block state and the KVM slots reflecting exactly the slots
+  that were updated.
+- [#5956](https://github.com/firecracker-microvm/firecracker/pull/5956): Fixed a
+  TOCTOU race in the aarch64 jailer when setting ownership of the CPU cache and
+  `MIDR_EL1` information files copied into the chroot.
+- [#6076](https://github.com/firecracker-microvm/firecracker/pull/6076): Fixed
+  memory hotplug sizes silently wrapping when converted from MiB to bytes.
+  `requested_size_mib` on `PATCH /hotplug/memory` and `total_size_mib`,
+  `block_size_mib` and `slot_size_mib` on `PUT /hotplug/memory` are now bounded
+  to 32 bits. Values above that previously wrapped to a smaller byte count, so a
+  large enough request was accepted as a 0-byte region instead of being
+  rejected.
+- [#6031](https://github.com/firecracker-microvm/firecracker/pull/6031),
+  [#6041](https://github.com/firecracker-microvm/firecracker/pull/6041),
+  [#6077](https://github.com/firecracker-microvm/firecracker/pull/6077): Fixed
+  the vsock device re-arming its host-stream `EPOLLIN` interest while received
+  data was still awaiting a guest RX buffer, which could busy-spin the event
+  thread until the guest posted buffers. The device now drains the host stream
+  fully across successive RX operations instead of one packet per event loop
+  iteration, reducing the host-side CPU cost per gigabit of host-to-guest
+  traffic by up to ~50% and improving host-to-guest throughput by ~44% (median)
+  in most configurations. On single-vcpu microVMs on the newest Intel hosts
+  (m7i, m8i), host-to-guest throughput may instead decrease by ~15% (median),
+  where the single guest vCPU rather than the host becomes the bottleneck.
+  Terminating a connection now also discards its TX buffer, so the device stops
+  advertising `EPOLLOUT` for a host stream it will never write to again, which
+  could otherwise busy-spin the event thread indefinitely.
+- [#6086](https://github.com/firecracker-microvm/firecracker/pull/6086),
+  [#6143](https://github.com/firecracker-microvm/firecracker/pull/6143): Fixed a
+  deadlock in the logger: a signal handler that logs while the interrupted
+  thread is already logging would hang the VMM and its API socket. This is
+  reachable whenever a `SIGPIPE` is raised by Firecracker's own log write, for
+  example when logging to `stdout` and the reader of that pipe exits. The logger
+  now uses an `RwLock`, and `sigpipe_handler` only increments the
+  `signals.sigpipe` metric instead of logging, so it no longer emits a
+  `Received signal 13, code 0.` line.
+- [#6120](https://github.com/firecracker-microvm/firecracker/pull/6120): Fixed a
+  bug caused by a KVM behavior change introduced in Linux 6.13, which requires
+  guest CPUID to be set before userspace reads CPUID-dependent MSRs. On x86_64
+  with Linux 6.18 host kernels, Firecracker read the base values of those MSRs
+  before setting guest CPUID, so KVM returned zero for such MSRs and CPU
+  templates consequently used zero for bits configured for passthrough.
+  Firecracker now sets guest CPUID before reading MSRs to be modified by CPU
+  templates, so passthrough bits retain their KVM-provided values and features
+  such as eIBRS remain exposed to the guest.
+
+## [1.16.1]
+
+### Fixed
+
+- [#5959](https://github.com/firecracker-microvm/firecracker/pull/5959):
+  Reverted the use of `O_NOFOLLOW` for the jailer's cgroup and network namespace
+  file operations, so symlinks are again allowed in these paths.
+- [#5958](https://github.com/firecracker-microvm/firecracker/pull/5958): Fixed a
+  bug that caused vsock guest-to-host connections to time out after snapshot
+  restore, triggered by taking a snapshot with a TX descriptor in-flight. On
+  restore the device now replays the TX queue notification so in-flight TX
+  descriptors are re-processed and notification suppression is re-armed.
+
+## [1.16.0]
+
+### Added
+
+- [#5786](https://github.com/firecracker-microvm/firecracker/pull/5786): Added
+  developer preview support for hotplugging and hot-unplugging PCI virtio
+  devices (block, pmem, net) on a running microVM. The guest must manually
+  rescan the PCI bus after hotplug and remove the device before unplug since no
+  automatic notification mechanism is implemented yet. More information can be
+  found in the [Device Hotplugging](docs/device-hotplug.md) documentation page.
 - [#5323](https://github.com/firecracker-microvm/firecracker/pull/5323): Add
   support for Vsock Unix domain socket path overriding on snapshot restore. More
   information can be found in the
@@ -84,6 +302,23 @@ full list.
   logging resumes after suppression, a warn-level summary reports the count of
   suppressed messages. A new `rate_limited_log_count` metric tracks the total
   number of suppressed messages.
+- [#5789](https://github.com/firecracker-microvm/firecracker/pull/5789): Add
+  rate-limiter support to virtio-pmem device to allow control over I/O bandwidth
+  generated by the FLUSH requests from the guest.
+- [#5872](https://github.com/firecracker-microvm/firecracker/pull/5872): Add
+  notification suppression support in the virtio-vsock device via the EVENT_IDX
+  virtio feature to reduce device overhead.
+- [#5828](https://github.com/firecracker-microvm/firecracker/pull/5828):
+  Advertise MTU to the guest via `VIRTIO_NET_F_MTU` using a new optional `mtu`
+  field in the `network-interfaces` API. When set, a compatible guest driver
+  will configure the interface with the specified MTU.
+- [#5906](https://github.com/firecracker-microvm/firecracker/pull/5906): Add
+  `rng-seed` FDT node for aarch64 guests which provides an initial random seed
+  for the guest to use. This helps older aarch64 machines which do not have
+  hardware random generators.
+- Added support for Linux 6.18 host kernels alongside the existing 5.10 and 6.1
+  host kernels. See the [kernel support policy](docs/kernel-policy.md) for
+  details.
 
 ### Changed
 
@@ -141,6 +376,14 @@ full list.
 - [#5818](https://github.com/firecracker-microvm/firecracker/pull/5818): Reject
   device status writes that clear previously set bits in the MMIO transport,
   except for reset.
+- [#5884](https://github.com/firecracker-microvm/firecracker/pull/5884):
+  Corrected the OpenAPI spec for `PATCH /balloon/hinting/start` and
+  `PATCH /balloon/hinting/stop` to declare `204 No Content` instead of `200`,
+  matching the actual runtime response.
+- [#5882](https://github.com/firecracker-microvm/firecracker/pull/5882): Fixed a
+  race in the vsock device where, after snapshot restore, the RX queue could
+  deliver data to the guest before it had acknowledged the TRANSPORT_RESET
+  event, causing established connections to break.
 
 ## [1.15.0]
 

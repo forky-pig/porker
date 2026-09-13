@@ -8,6 +8,7 @@ import pytest
 
 import host_tools.drive as drive_tools
 from framework import utils
+from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel, pin_rootfs_mode
 from framework.utils_drive import partuuid_and_disk_path
 
 MB = 1024 * 1024
@@ -23,11 +24,11 @@ def partuuid_and_disk_path_tmpfs(rootfs, tmp_path):
     disk_path.unlink()
 
 
-def test_rescan_file(uvm_plain_any, io_engine):
+def test_rescan_file(uvm, io_engine):
     """
     Verify that rescan works with a file-backed virtio device.
     """
-    test_microvm = uvm_plain_any
+    test_microvm = uvm
     test_microvm.spawn()
 
     # Set up the microVM with 1 vCPUs, 256 MiB of RAM and a root file system
@@ -64,14 +65,14 @@ def test_rescan_file(uvm_plain_any, io_engine):
     _check_block_size(test_microvm.ssh, "/dev/vdb", fs.size())
 
 
-def test_device_ordering(uvm_plain_any, io_engine):
+def test_device_ordering(uvm, io_engine):
     """
     Verify device ordering.
 
     The root device should correspond to /dev/vda in the guest and
     the order of the other devices should match their configuration order.
     """
-    test_microvm = uvm_plain_any
+    test_microvm = uvm
     test_microvm.spawn()
 
     # Add first scratch block device.
@@ -111,11 +112,11 @@ def test_device_ordering(uvm_plain_any, io_engine):
     _check_block_size(ssh_connection, "/dev/vdc", fs2.size())
 
 
-def test_rescan_dev(uvm_plain_any, io_engine):
+def test_rescan_dev(uvm, io_engine):
     """
     Verify that rescan works with a device-backed virtio device.
     """
-    test_microvm = uvm_plain_any
+    test_microvm = uvm
     test_microvm.spawn()
 
     # Set up the microVM with 1 vCPUs, 256 MiB of RAM and a root file system
@@ -151,11 +152,11 @@ def test_rescan_dev(uvm_plain_any, io_engine):
             utils.check_output(["losetup", "--detach", loopback_device])
 
 
-def test_non_partuuid_boot(uvm_plain_any, io_engine):
+def test_non_partuuid_boot(uvm, io_engine):
     """
     Test the output reported by blockdev when booting from /dev/vda.
     """
-    test_microvm = uvm_plain_any
+    test_microvm = uvm
     test_microvm.spawn()
 
     # Sets up the microVM with 1 vCPUs, 256 MiB of RAM and a root file system
@@ -179,7 +180,7 @@ def test_non_partuuid_boot(uvm_plain_any, io_engine):
     _check_drives(test_microvm, assert_dict, assert_dict.keys())
 
 
-def test_partuuid_boot(uvm_plain_any, partuuid_and_disk_path_tmpfs, io_engine):
+def test_partuuid_boot(uvm, partuuid_and_disk_path_tmpfs, io_engine):
     """
     Test the output reported by blockdev when booting with PARTUUID.
     """
@@ -187,7 +188,7 @@ def test_partuuid_boot(uvm_plain_any, partuuid_and_disk_path_tmpfs, io_engine):
     partuuid = partuuid_and_disk_path_tmpfs[0]
     disk_path = partuuid_and_disk_path_tmpfs[1]
 
-    test_microvm = uvm_plain_any
+    test_microvm = uvm
     test_microvm.spawn()
 
     # Sets up the microVM with 1 vCPUs, 256 MiB of RAM and without root file system
@@ -213,11 +214,11 @@ def test_partuuid_boot(uvm_plain_any, partuuid_and_disk_path_tmpfs, io_engine):
     _check_drives(test_microvm, assert_dict, assert_dict.keys())
 
 
-def test_partuuid_update(uvm_plain_any, io_engine):
+def test_partuuid_update(uvm, io_engine):
     """
     Test successful switching from PARTUUID boot to /dev/vda boot.
     """
-    test_microvm = uvm_plain_any
+    test_microvm = uvm
     test_microvm.spawn()
 
     # Set up the microVM with 1 vCPUs, 256 MiB of RAM
@@ -251,11 +252,11 @@ def test_partuuid_update(uvm_plain_any, io_engine):
     _check_drives(test_microvm, assert_dict, assert_dict.keys())
 
 
-def test_patch_drive(uvm_plain_any, io_engine):
+def test_patch_drive(uvm, io_engine):
     """
     Test replacing the backing filesystem after guest boot works.
     """
-    test_microvm = uvm_plain_any
+    test_microvm = uvm
     test_microvm.spawn()
 
     # Set up the microVM with 1 vCPUs, 256 MiB of RAM and a root file system
@@ -289,11 +290,11 @@ def test_patch_drive(uvm_plain_any, io_engine):
     assert lines[1].strip() == size_bytes_str
 
 
-def test_no_flush(uvm_plain_any, io_engine):
+def test_no_flush(uvm, io_engine):
     """
     Verify default block ignores flush.
     """
-    test_microvm = uvm_plain_any
+    test_microvm = uvm
     test_microvm.spawn()
 
     test_microvm.basic_config(vcpu_count=1, add_root_device=False)
@@ -323,11 +324,53 @@ def test_no_flush(uvm_plain_any, io_engine):
     assert fc_metrics["block"]["flush_count"] == 0
 
 
-def test_flush(uvm_plain_rw, io_engine):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_discard(uvm):
+    """
+    Verify discard is advertised and punches holes in a file-backed drive.
+    """
+    test_microvm = uvm
+    test_microvm.spawn()
+
+    test_microvm.basic_config(vcpu_count=1)
+    test_microvm.add_net_iface()
+
+    fs = drive_tools.FilesystemFile(
+        os.path.join(test_microvm.fsfiles, "discard"), size=64
+    )
+    test_microvm.add_drive("discard", fs.path, discard=True, io_engine="Sync")
+
+    test_microvm.start()
+
+    _, stdout, stderr = test_microvm.ssh.run(
+        "cat /sys/block/vdb/queue/discard_granularity"
+    )
+    assert stderr == ""
+    assert int(stdout.strip()) > 0
+
+    _, _, stderr = test_microvm.ssh.run(
+        "dd if=/dev/zero of=/dev/vdb bs=1M count=32 oflag=direct conv=fsync status=none",
+        timeout=30.0,
+    )
+    assert stderr == ""
+
+    blocks_before = os.stat(fs.path).st_blocks
+    assert blocks_before > 0
+
+    _, _, stderr = test_microvm.ssh.run("blkdiscard -f /dev/vdb", timeout=30.0)
+    assert stderr in ("", "blkdiscard: Operation forced, data will be lost!\n")
+
+    blocks_after = os.stat(fs.path).st_blocks
+    assert blocks_after < blocks_before
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+@pin_rootfs_mode("rw")
+def test_flush(uvm, io_engine):
     """
     Verify block with flush actually flushes.
     """
-    test_microvm = uvm_plain_rw
+    test_microvm = uvm
     test_microvm.spawn()
     test_microvm.basic_config(vcpu_count=1, add_root_device=False)
     test_microvm.add_net_iface()
@@ -383,3 +426,139 @@ def _check_mount(ssh_connection, dev_path):
     assert stderr == ""
     _, _, stderr = ssh_connection.run("umount /tmp", timeout=30.0)
     assert stderr == ""
+
+
+def test_device_reset(uvm, io_engine):
+    """
+    Test that virtio-block device reset works.
+    """
+    vm = uvm
+    vm.spawn()
+    vm.basic_config()
+    vm.add_net_iface()
+
+    fs = drive_tools.FilesystemFile(os.path.join(vm.fsfiles, "scratch"), size=2)
+    vm.add_drive("scratch", fs.path, io_engine=io_engine)
+    vm.start()
+
+    # Verify the scratch drive is accessible.
+    vm.ssh.check_output("mount /dev/vdb /tmp && umount /tmp")
+
+    # Find the virtio device backing vdb and unbind it.
+    virtio_dev = vm.ssh.check_output(
+        "basename $(readlink /sys/block/vdb/device)"
+    ).stdout.strip()
+
+    vm.ssh.check_output(
+        f"echo {virtio_dev} > /sys/bus/virtio/drivers/virtio_blk/unbind"
+    )
+
+    # Verify the drive is gone.
+    ret = vm.ssh.run("ls /dev/vdb")
+    assert ret.returncode != 0
+
+    # Rebind and verify the drive is back.
+    vm.ssh.check_output(f"echo {virtio_dev} > /sys/bus/virtio/drivers/virtio_blk/bind")
+    vm.ssh.check_output("ls /dev/vdb")
+    vm.ssh.check_output("mount /dev/vdb /tmp && umount /tmp")
+
+
+def _read_queue_attr(ssh, dev_name, attr):
+    _, stdout, stderr = ssh.run(f"cat /sys/block/{dev_name}/queue/{attr}")
+    assert stderr == ""
+    return int(stdout.strip())
+
+
+def test_blk_size(uvm, io_engine):
+    """
+    When blk_size is set, the guest must use this value as the logical
+    block size for the drive.
+    """
+    vm = uvm
+    vm.spawn()
+    vm.basic_config()
+    vm.add_net_iface()
+
+    blk_size1 = 2048
+    fs1 = drive_tools.FilesystemFile(os.path.join(vm.fsfiles, "scratch1"), size=8)
+    vm.add_drive("scratch1", fs1.path, io_engine=io_engine, blk_size=blk_size1)
+
+    blk_size2 = 4096
+    fs2 = drive_tools.FilesystemFile(os.path.join(vm.fsfiles, "scratch2"), size=8)
+    vm.add_drive("scratch2", fs2.path, io_engine=io_engine, blk_size=blk_size2)
+
+    vm.start()
+
+    assert _read_queue_attr(vm.ssh, "vdb", "logical_block_size") == blk_size1
+    assert _read_queue_attr(vm.ssh, "vdc", "logical_block_size") == blk_size2
+
+
+LOGICAL_BLOCK_SIZE = 512
+
+
+def test_topology_defaults(uvm, io_engine):
+    """
+    If topology is not set by the user and the backing file is not a host
+    block device, Firecracker exposes a fixed set of defaults:
+      physical_block_exp = 0  -> physical_block_size = 512
+      min_io_size        = 0  -> guest clamps minimum_io_size up to
+                                 physical_block_size (512)
+      opt_io_size        = 128 -> optimal_io_size    = 512 * 128       = 65536
+
+    This test ensures same behaviour on all guest kernels.
+    """
+    vm = uvm
+    vm.spawn()
+    vm.basic_config()
+    vm.add_net_iface()
+
+    fs = drive_tools.FilesystemFile(os.path.join(vm.fsfiles, "scratch"), size=8)
+    vm.add_drive("scratch", fs.path, io_engine=io_engine)
+    vm.start()
+
+    assert _read_queue_attr(vm.ssh, "vdb", "logical_block_size") == LOGICAL_BLOCK_SIZE
+    assert _read_queue_attr(vm.ssh, "vdb", "physical_block_size") == LOGICAL_BLOCK_SIZE
+    assert _read_queue_attr(vm.ssh, "vdb", "minimum_io_size") == LOGICAL_BLOCK_SIZE
+    assert (
+        _read_queue_attr(vm.ssh, "vdb", "optimal_io_size") == LOGICAL_BLOCK_SIZE * 128
+    )
+
+
+def test_topology_advertised(uvm, io_engine):
+    """
+    When topology is set, the guest must set the corresponding options for the queue.
+    """
+    vm = uvm
+    vm.spawn()
+    vm.basic_config()
+    vm.add_net_iface()
+
+    topology = {
+        "physical_block_exp": 4,
+        "alignment_offset": 0,
+        "min_io_size": 64,
+        "opt_io_size": 256,
+    }
+    expected = {
+        "physical_block_size": LOGICAL_BLOCK_SIZE * (1 << 4),
+        "minimum_io_size": LOGICAL_BLOCK_SIZE * 64,
+        "optimal_io_size": LOGICAL_BLOCK_SIZE * 256,
+    }
+
+    fs = drive_tools.FilesystemFile(os.path.join(vm.fsfiles, "scratch"), size=8)
+    vm.add_drive("scratch", fs.path, io_engine=io_engine, topology=topology)
+    vm.start()
+
+    assert _read_queue_attr(vm.ssh, "vdb", "logical_block_size") == LOGICAL_BLOCK_SIZE
+    assert (
+        _read_queue_attr(vm.ssh, "vdb", "physical_block_size")
+        == expected["physical_block_size"]
+    )
+    assert (
+        _read_queue_attr(vm.ssh, "vdb", "minimum_io_size")
+        == expected["minimum_io_size"]
+    )
+    assert (
+        _read_queue_attr(vm.ssh, "vdb", "optimal_io_size")
+        == expected["optimal_io_size"]
+    )

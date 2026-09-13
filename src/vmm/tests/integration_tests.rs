@@ -10,7 +10,10 @@ use std::time::Duration;
 
 use vmm::builder::build_and_boot_microvm;
 use vmm::devices::virtio::block::CacheType;
-use vmm::persist::{MicrovmState, MicrovmStateError, VmInfo, snapshot_state_sanity_check};
+use vmm::persist::{
+    GuestMemoryFromFileError, MicrovmState, MicrovmStateError, RestoreFromSnapshotError,
+    RestoreFromSnapshotGuestMemoryError, VirtioDevicesState, VmInfo, snapshot_state_sanity_check,
+};
 use vmm::resources::VmResources;
 use vmm::rpc_interface::{
     LoadSnapshotError, PrebootApiController, RuntimeApiController, VmmAction, VmmActionError,
@@ -23,10 +26,11 @@ use vmm::vmm_config::balloon::BalloonDeviceConfig;
 use vmm::vmm_config::boot_source::BootSourceConfig;
 use vmm::vmm_config::drive::BlockDeviceConfig;
 use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
-use vmm::vmm_config::machine_config::{MachineConfig, MachineConfigUpdate};
+use vmm::vmm_config::machine_config::{HugePageConfig, MachineConfig, MachineConfigUpdate};
 use vmm::vmm_config::net::NetworkInterfaceConfig;
 use vmm::vmm_config::snapshot::{
-    CreateSnapshotParams, LoadSnapshotParams, MemBackendConfig, MemBackendType, SnapshotType,
+    CreateSnapshotParams, LoadSnapshotParams, MemBackendConfig, MemBackendType,
+    SnapshotLoadHugePageConfig, SnapshotType,
 };
 use vmm::vmm_config::vsock::VsockDeviceConfig;
 use vmm::{DumpCpuConfigError, EventManager, FcExitCode, Vmm};
@@ -103,14 +107,21 @@ fn test_build_microvm() {
 
 fn pause_resume_microvm(vmm: Arc<Mutex<Vmm>>) {
     let mut api_controller = RuntimeApiController::new(vmm.clone());
+    let mut event_manager = EventManager::new().unwrap();
 
     // There's a race between this thread and the vcpu thread, but this thread
     // should be able to pause vcpu thread before it finishes running its test-binary.
-    api_controller.handle_request(VmmAction::Pause).unwrap();
+    api_controller
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
     // Pausing again the microVM should not fail (microVM remains in the
     // `Paused` state).
-    api_controller.handle_request(VmmAction::Pause).unwrap();
-    api_controller.handle_request(VmmAction::Resume).unwrap();
+    api_controller
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
+    api_controller
+        .handle_request(VmmAction::Resume, &mut event_manager)
+        .unwrap();
 
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 }
@@ -138,7 +149,14 @@ fn test_dirty_bitmap_success() {
     for (vmm, _) in vmms {
         // Let it churn for a while and dirty some pages...
         thread::sleep(Duration::from_millis(100));
-        let bitmap = vmm.lock().unwrap().vm.get_dirty_bitmap().unwrap();
+        let bitmap = vmm
+            .lock()
+            .unwrap()
+            .vm
+            .as_kvm()
+            .unwrap()
+            .get_dirty_bitmap()
+            .unwrap();
         let num_dirty_pages: u32 = bitmap
             .values()
             .map(|bitmap_per_region| {
@@ -213,12 +231,15 @@ fn verify_create_snapshot(
 
     let vm_info = VmInfo::from(&*vmm.lock().unwrap());
     let mut controller = RuntimeApiController::new(vmm.clone());
+    let mut event_manager = EventManager::new().unwrap();
 
     // Be sure that the microVM is running.
     thread::sleep(Duration::from_millis(200));
 
     // Pause microVM.
-    controller.handle_request(VmmAction::Pause).unwrap();
+    controller
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
 
     // Create snapshot.
     let snapshot_type = match is_diff {
@@ -229,10 +250,14 @@ fn verify_create_snapshot(
         snapshot_type,
         snapshot_path: snapshot_file.as_path().to_path_buf(),
         mem_file_path: memory_file.as_path().to_path_buf(),
+        sync_snapshot_files: true,
     };
 
     controller
-        .handle_request(VmmAction::CreateSnapshot(snapshot_params))
+        .handle_request(
+            VmmAction::CreateSnapshot(snapshot_params),
+            &mut event_manager,
+        )
         .unwrap();
 
     vmm.lock().unwrap().stop(FcExitCode::Ok);
@@ -245,35 +270,31 @@ fn verify_create_snapshot(
 
     // Verify deserialized data.
     // The default vmm has no devices and one vCPU.
-    assert_eq!(
-        restored_microvm_state
-            .device_states
-            .mmio_state
-            .block_devices
-            .len(),
-        0
-    );
-    assert_eq!(
-        restored_microvm_state
-            .device_states
-            .mmio_state
-            .net_devices
-            .len(),
-        0
-    );
-    assert!(
-        restored_microvm_state
-            .device_states
-            .mmio_state
-            .vsock_device
-            .is_none()
-    );
+    match &restored_microvm_state.device_states.virtio_state {
+        VirtioDevicesState::Mmio(state) => {
+            assert!(!pci_enabled);
+            assert_eq!(state.block_devices.len(), 0);
+            assert_eq!(state.net_devices.len(), 0);
+            assert!(state.vsock_device.is_none());
+        }
+        VirtioDevicesState::Pci(state) => {
+            assert!(pci_enabled);
+            assert_eq!(state.block_devices.len(), 0);
+            assert_eq!(state.net_devices.len(), 0);
+            assert!(state.vsock_device.is_none());
+        }
+    }
     assert_eq!(restored_microvm_state.vcpu_states.len(), 1);
 
     (snapshot_file, memory_file)
 }
 
-fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
+fn verify_load_snapshot(
+    snapshot_file: TempFile,
+    memory_file: TempFile,
+    huge_pages: SnapshotLoadHugePageConfig,
+) {
+    let expected_huge_pages = huge_pages.resolve(HugePageConfig::None);
     let mut event_manager = EventManager::new().unwrap();
     let empty_seccomp_filters = get_empty_filters();
     let mut vm_resources = VmResources::default();
@@ -297,12 +318,17 @@ fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
             network_overrides: vec![],
             vsock_override: None,
             clock_realtime: false,
+            huge_pages,
         }))
         .unwrap();
 
     let vmm = preboot_api_controller.built_vmm.take().unwrap();
 
-    assert_eq!(vmm.lock().unwrap().instance_info.state, VmState::Running);
+    {
+        let vmm = vmm.lock().unwrap();
+        assert_eq!(vmm.instance_info.state, VmState::Running);
+        assert_eq!(vmm.machine_config.huge_pages, expected_huge_pages);
+    }
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 }
 
@@ -318,10 +344,64 @@ fn test_create_and_load_snapshot() {
                 // that a microVM can be built with no errors from given snapshot.
                 // It does _not_ verify that the guest is actually restored properly. We're using
                 // python integration tests for that.
-                verify_load_snapshot(snapshot_file, memory_file);
+                verify_load_snapshot(
+                    snapshot_file,
+                    memory_file,
+                    SnapshotLoadHugePageConfig::Snapshot,
+                );
             }
         }
     }
+}
+
+#[test]
+fn test_load_snapshot_huge_pages_override() {
+    let (snapshot_file, memory_file) = verify_create_snapshot(false, false, false);
+
+    verify_load_snapshot(
+        snapshot_file,
+        memory_file,
+        SnapshotLoadHugePageConfig::Transparent,
+    );
+}
+
+#[test]
+fn test_load_snapshot_rejects_hugetlbfs_with_file_backend() {
+    let (snapshot_file, memory_file) = verify_create_snapshot(false, false, false);
+    let mut event_manager = EventManager::new().unwrap();
+    let empty_seccomp_filters = get_empty_filters();
+    let mut vm_resources = VmResources::default();
+    let mut preboot_api_controller = PrebootApiController::new(
+        &empty_seccomp_filters,
+        InstanceInfo::default(),
+        &mut vm_resources,
+        &mut event_manager,
+    );
+
+    let error = preboot_api_controller
+        .handle_preboot_request(VmmAction::LoadSnapshot(LoadSnapshotParams {
+            snapshot_path: snapshot_file.as_path().to_path_buf(),
+            mem_backend: MemBackendConfig {
+                backend_path: memory_file.as_path().to_path_buf(),
+                backend_type: MemBackendType::File,
+            },
+            track_dirty_pages: false,
+            resume_vm: false,
+            network_overrides: vec![],
+            vsock_override: None,
+            clock_realtime: false,
+            huge_pages: SnapshotLoadHugePageConfig::Hugetlbfs2M,
+        }))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        VmmActionError::LoadSnapshot(LoadSnapshotError::RestoreFromSnapshot(
+            RestoreFromSnapshotError::GuestMemory(RestoreFromSnapshotGuestMemoryError::File(
+                GuestMemoryFromFileError::HugetlbfsSnapshot
+            ))
+        ))
+    ));
 }
 
 #[test]
@@ -383,6 +463,7 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
         network_overrides: vec![],
         vsock_override: None,
         clock_realtime: false,
+        huge_pages: SnapshotLoadHugePageConfig::Snapshot,
     });
     let err = preboot_api_controller.handle_preboot_request(req);
     assert!(
@@ -413,9 +494,12 @@ fn test_preboot_load_snap_disallowed_after_boot_resources() {
         cache_type: CacheType::Unsafe,
 
         is_read_only: Some(false),
+        discard: None,
         path_on_host: Some(tmp_file),
         rate_limiter: None,
         file_engine_type: None,
+        blk_size: None,
+        topology: None,
 
         socket: None,
     };
@@ -427,6 +511,7 @@ fn test_preboot_load_snap_disallowed_after_boot_resources() {
         iface_id: String::new(),
         host_dev_name: String::new(),
         guest_mac: None,
+        mtu: None,
         rx_rate_limiter: None,
         tx_rate_limiter: None,
     });

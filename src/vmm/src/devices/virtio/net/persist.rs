@@ -8,11 +8,10 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use super::device::{Net, RxBuffers};
-use super::{NET_NUM_QUEUES, NET_QUEUE_MAX_SIZE, RX_INDEX, TapError};
-use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDeviceType};
+use super::device::Net;
+use super::{NET_NUM_QUEUES, NET_QUEUE_MAX_SIZE, TapError};
+use crate::devices::virtio::device::VirtioDeviceType;
 use crate::devices::virtio::persist::{PersistError as VirtioStateError, VirtioDeviceState};
-use crate::devices::virtio::transport::VirtioInterrupt;
 use crate::mmds::data_store::Mmds;
 use crate::mmds::ns::MmdsNetworkStack;
 use crate::mmds::persist::MmdsNetworkStackState;
@@ -27,6 +26,8 @@ use crate::vstate::memory::GuestMemoryMmap;
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct NetConfigSpaceState {
     guest_mac: Option<MacAddr>,
+    #[serde(default)]
+    mtu: Option<u16>,
 }
 
 /// Information about the network device that are saved
@@ -81,6 +82,7 @@ impl Persist<'_> for Net {
             mmds_ns: self.mmds_ns.as_ref().map(|mmds| mmds.save()),
             config_space: NetConfigSpaceState {
                 guest_mac: self.guest_mac,
+                mtu: self.mtu(),
             },
             virtio_state: VirtioDeviceState::from_device(self),
         }
@@ -99,9 +101,10 @@ impl Persist<'_> for Net {
             state.config_space.guest_mac,
             rx_rate_limiter,
             tx_rate_limiter,
+            state.config_space.mtu,
         )?;
 
-        // We trust the MMIODeviceManager::restore to pass us an MMDS data store reference if
+        // We trust the MMIOVirtioDevices::restore to pass us an MMDS data store reference if
         // there is at least one net device having the MMDS NS present and/or the mmds version was
         // persisted in the snapshot.
         if let Some(mmds_ns) = &state.mmds_ns {
@@ -137,7 +140,7 @@ mod tests {
     use super::*;
     use crate::devices::virtio::device::VirtioDevice;
     use crate::devices::virtio::net::test_utils::{default_net, default_net_no_mmds};
-    use crate::devices::virtio::test_utils::{default_interrupt, default_mem};
+    use crate::devices::virtio::test_utils::default_mem;
 
     fn validate_save_and_restore(net: Net, mmds_ds: Option<Arc<Mutex<Mmds>>>) {
         let guest_mem = default_mem();
@@ -203,13 +206,13 @@ mod tests {
         validate_save_and_restore(default_net(), mmds.as_ref().cloned());
         validate_save_and_restore(default_net_no_mmds(), None);
 
-        // Check what happens if the MMIODeviceManager gives us the reference to the MMDS
+        // Check what happens if MMIOVirtioDevices::restore gives us the reference to the MMDS
         // data store even if this device does not have mmds ns configured.
         // The restore should be conservative and not configure the mmds ns.
         validate_save_and_restore(default_net_no_mmds(), mmds);
 
-        // Check what happens if the MMIODeviceManager does not give us the reference to the MMDS
-        // data store. This will return an error.
+        // Check what happens if MMIOVirtioDevices::restore does not give us the reference to the
+        // MMDS data store. This will return an error.
         validate_save_and_restore(default_net(), None);
     }
 }

@@ -13,15 +13,15 @@ use std::sync::{Arc, Barrier};
 use kvm_bindings::kvm_userspace_memory_region;
 use vm_memory::GuestMemoryRegion;
 
-use crate::pci::{DeviceRelocationError, PciDevice};
+use crate::pci::PciDevice;
 use crate::pci::PciSBDF;
 use crate::vfio::{VfioContainer, VfioDevice, VfioError, VfioGroup, KvmVfioDevice};
 use crate::vfio::{
-    VFIO_PCI_MSI_IRQ_INDEX, VFIO_PCI_MSIX_IRQ_INDEX, VFIO_IRQ_INFO_EVENTFD,
-    VFIO_PCI_ROM_REGION_INDEX,
+    VFIO_PCI_MSI_IRQ_INDEX, VFIO_PCI_MSIX_IRQ_INDEX, VFIO_PCI_ROM_REGION_INDEX,
 };
-use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorConfig, MsixVectorGroup};
-use crate::Vm;
+use crate::pci::msix::MsixTableEntry;
+use crate::vstate::interrupts::MsixVectorGroup;
+use crate::vstate::vm::KvmVm;
 
 // PCI config space register indices (each register is 4 bytes)
 const PCI_BAR0_REG_IDX: u16 = 4;  // offset 0x10
@@ -39,7 +39,6 @@ const PCI_CAP_ID_MSIX: u8 = 0x11;
 
 // MSI capability field offsets (relative to cap start)
 const MSI_CAP_CONTROL_OFFSET: u8 = 2; // 2-byte message control field
-const MSI_CTRL_ENABLE: u16 = 1 << 0; // bit 0 of message control
 const MSI_CTRL_64BIT: u16 = 1 << 7; // bit 7: 64-bit address capable
 // Byte offsets of addr/data within the MSI capability (after the 4-byte header)
 const MSI_CAP_ADDR_LO_OFFSET: u64 = 4;
@@ -56,7 +55,6 @@ const MSIX_CTRL_ENABLE: u16 = 1 << 15;
 
 // MSI-X table entry size in bytes
 const MSIX_ENTRY_SIZE: usize = 16; // 4 × u32: addr_lo, addr_hi, data, vector_ctrl
-const MSIX_ENTRY_VECTOR_CTRL_MASKED: u32 = 1;
 
 // BAR type bits (lower 4 bits of BAR register value)
 const PCI_BAR_IO: u32 = 1;
@@ -107,7 +105,7 @@ pub struct VfioPciDevice {
     /// MSI-X interrupt vectors
     msix_vectors: MsixVectorGroup,
     /// Reference to the VM (for KVM irqfd/routing operations)
-    vm: Arc<Vm>,
+    vm: Arc<KvmVm>,
     /// Byte offset of the MSI-X capability in config space (if present)
     msix_cap_offset: Option<u32>,
     /// Which VFIO region index contains the MSI-X table (from Table BIR)
@@ -160,7 +158,7 @@ impl VfioPciDevice {
         container: VfioContainer,
         group: VfioGroup,
         host_bdf: &str,
-        vm: Arc<Vm>,
+        vm: Arc<KvmVm>,
         sbdf: PciSBDF,
     ) -> Result<Self, VfioError> {
         // Phase C step 8: Create KVM VFIO device
@@ -199,7 +197,7 @@ impl VfioPciDevice {
             Self::scan_msix_capability(&device)?;
 
         // Phase H steps 18-20: Allocate MSI-X GSIs, create eventfds, wire to VFIO
-        let msix_vectors = Vm::create_msix_group(vm.clone(), num_msix_vectors as u16)?;
+        let msix_vectors = KvmVm::create_msix_group(vm.clone(), num_msix_vectors as u16)?;
 
         // Wire VFIO device MSI-X interrupts to eventfds
         if num_msix_vectors > 0 {
@@ -218,7 +216,7 @@ impl VfioPciDevice {
         let (msi_cap_offset, msi_is_64bit, msi_vector) = if num_msix_vectors == 0 {
             let (cap_off, is_64bit) = Self::scan_msi_capability(&device)?;
             let msi_vec = if cap_off.is_some() {
-                let group = Vm::create_msix_group(vm.clone(), 1)?;
+                let group = KvmVm::create_msix_group(vm.clone(), 1)?;
                 let fd = group.vectors[0].event_fd.as_raw_fd();
                 device.set_irqs_eventfds(VFIO_PCI_MSI_IRQ_INDEX, 0, &[fd])?;
                 Some(group)
@@ -259,7 +257,7 @@ impl VfioPciDevice {
     /// 1. mmap it from the VFIO device fd
     /// 2. Allocate a guest MMIO address from the resource allocator
     /// 3. Register the mapping with KVM via `KVM_SET_USER_MEMORY_REGION`
-    fn map_bars(device: &VfioDevice, vm: &Arc<Vm>) -> Result<Vec<VfioBar>, VfioError> {
+    fn map_bars(device: &VfioDevice, vm: &Arc<KvmVm>) -> Result<Vec<VfioBar>, VfioError> {
         let mut bars = Vec::new();
         let mut resource_allocator = vm.resource_allocator();
 
@@ -292,11 +290,11 @@ impl VfioPciDevice {
             let align = region.size.next_power_of_two();
             let guest_addr = if is_64bit {
                 resource_allocator
-                    .allocate_64bit_mmio_memory(region.size, align, vm_allocator::AllocPolicy::FirstMatch)
+                    .mmio64_memory.allocate(region.size, align, vm_allocator::AllocPolicy::FirstMatch).map(|r| r.start())
                     .map_err(VfioError::ResourceAllocation)?
             } else {
                 resource_allocator
-                    .allocate_32bit_mmio_memory(region.size, align, vm_allocator::AllocPolicy::FirstMatch)
+                    .mmio32_memory.allocate(region.size, align, vm_allocator::AllocPolicy::FirstMatch).map(|r| r.start())
                     .map_err(VfioError::ResourceAllocation)?
             };
 
@@ -338,7 +336,7 @@ impl VfioPciDevice {
     ///
     /// Returns `Some(VfioBar)` if the ROM was mapped, `None` if the device has no ROM or
     /// the ROM region is not mappable (in which case reg 12 reads return 0).
-    fn map_rom_bar(device: &VfioDevice, vm: &Arc<Vm>) -> Result<Option<VfioBar>, VfioError> {
+    fn map_rom_bar(device: &VfioDevice, vm: &Arc<KvmVm>) -> Result<Option<VfioBar>, VfioError> {
         let region = match device.rom_region() {
             Some(r) if r.size > 0 && r.is_mappable() => *r,
             _ => return Ok(None),
@@ -350,7 +348,7 @@ impl VfioPciDevice {
         let align = region.size.next_power_of_two().max(4096);
         let guest_addr = vm
             .resource_allocator()
-            .allocate_64bit_mmio_memory(region.size, align, vm_allocator::AllocPolicy::FirstMatch)
+            .mmio64_memory.allocate(region.size, align, vm_allocator::AllocPolicy::FirstMatch).map(|r| r.start())
             .map_err(VfioError::ResourceAllocation)?;
 
         let host_ptr = device.mmap_bar(&region)?;
@@ -388,8 +386,8 @@ impl VfioPciDevice {
     ///
     /// This allows the passthrough device to DMA directly to/from guest memory
     /// with IOMMU protection.
-    fn map_guest_ram_dma(container: &VfioContainer, vm: &Arc<Vm>) -> Result<(), VfioError> {
-        use crate::vstate::memory::{GuestMemory, GuestMemoryExtension};
+    fn map_guest_ram_dma(container: &VfioContainer, vm: &Arc<KvmVm>) -> Result<(), VfioError> {
+        use vm_memory::GuestMemoryBackend;
 
         for region in vm.guest_memory().iter() {
             let host_addr = region
@@ -536,19 +534,17 @@ impl VfioPciDevice {
             .read_config_at(cap_off as u64 + data_offset, &mut data_bytes)?;
         let data = u32::from_le_bytes(data_bytes);
 
-        let msi_config = MsixVectorConfig {
-            low_addr: addr_lo,
-            high_addr: addr_hi,
-            data,
-            devid: self.sbdf,
+        let entry = MsixTableEntry {
+            msg_addr_lo: addr_lo,
+            msg_addr_hi: addr_hi,
+            msg_data: data,
+            vector_ctl: 0, // unmasked
         };
 
-        let vector = &group.vectors[0];
-        self.vm
-            .register_msi(vector, false, msi_config)
-            .map_err(|e| VfioError::Io(std::io::Error::other(format!("register_msi: {e}"))))?;
-        self.vm.set_gsi_routes().map_err(VfioError::Interrupt)?;
-        vector.enable(&self.vm.fd()).map_err(VfioError::Interrupt)?;
+        // Registers the KVM route, pushes the GSI routing table and enables the irqfd.
+        group
+            .update(0, &entry, self.sbdf)
+            .map_err(VfioError::Interrupt)?;
 
         Ok(())
     }
@@ -593,24 +589,26 @@ impl VfioPciDevice {
                 std::ptr::read_volatile(table_bar.host_ptr.add(entry_offset + 12) as *const u32)
             };
 
-            let masked = vector_ctrl & MSIX_ENTRY_VECTOR_CTRL_MASKED != 0;
-
-            let msi_config = MsixVectorConfig {
-                low_addr: addr_lo,
-                high_addr: addr_hi,
-                data,
-                devid: self.sbdf,
+            // The table lives in device memory that is mapped straight into the guest, so this
+            // is the only point where the VMM sees the entries. Mirror them into KVM routes as
+            // before (the masked bit is taken from vector_ctrl) and push the routing table once.
+            let entry = MsixTableEntry {
+                msg_addr_lo: addr_lo,
+                msg_addr_hi: addr_hi,
+                msg_data: data,
+                vector_ctl: vector_ctrl,
             };
 
             self.vm
-                .register_msi(vector, masked, msi_config)
+                .register_msi(vector, &entry, self.sbdf)
                 .map_err(|e| VfioError::Io(std::io::Error::other(format!("register_msi: {e}"))))?;
         }
 
         // Push the updated routing table to KVM
         self.vm.set_gsi_routes().map_err(VfioError::Interrupt)?;
 
-        // Register irqfds for unmasked vectors
+        // Register irqfds for all vectors (unchanged behaviour: the hardware honours the
+        // per-vector mask bit itself, and later unmasks by the guest are not trapped).
         for vector in &self.msix_vectors.vectors {
             vector
                 .enable(&self.vm.fd())
@@ -835,7 +833,7 @@ impl Drop for VfioPciDevice {
 
         // Unmap BAR KVM memory slots by setting memory_size = 0.
         // Iterate both regular BARs and the ROM bar through a single helper closure.
-        let unmap_slot = |vm: &Arc<Vm>, bar: &VfioBar| {
+        let unmap_slot = |vm: &Arc<KvmVm>, bar: &VfioBar| {
             if !bar.host_ptr.is_null() {
                 let kvm_region = kvm_userspace_memory_region {
                     slot: bar.kvm_slot,

@@ -4,15 +4,13 @@
 //! Defines state and support structures for persisting Vsock devices and backends.
 
 use std::fmt::Debug;
-use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use super::*;
-use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDeviceType};
+use crate::devices::virtio::device::{DeviceState, VirtioDeviceType};
 use crate::devices::virtio::persist::VirtioDeviceState;
 use crate::devices::virtio::queue::FIRECRACKER_MAX_QUEUE_SIZE;
-use crate::devices::virtio::transport::VirtioInterrupt;
 use crate::snapshot::Persist;
 use crate::vstate::memory::GuestMemoryMmap;
 
@@ -31,6 +29,11 @@ pub struct VsockFrontendState {
     /// Context Identifier.
     pub cid: u64,
     pub virtio_state: VirtioDeviceState,
+    /// Whether a `TRANSPORT_RESET_EVENT` published to the guest's event queue
+    /// is still awaiting the driver's acknowledgment. RX delivery stays gated
+    /// until the guest acks, so a restored device must resume with the same
+    /// gate state the source device had.
+    pub pending_event_ack: bool,
 }
 
 /// The Vsock Unix Backend serializable state.
@@ -92,6 +95,7 @@ where
         VsockFrontendState {
             cid: self.cid(),
             virtio_state: VirtioDeviceState::from_device(self),
+            pending_event_ack: self.pending_event_ack,
         }
     }
 
@@ -114,6 +118,7 @@ where
         vsock.acked_features = state.virtio_state.acked_features;
         vsock.avail_features = state.virtio_state.avail_features;
         vsock.device_state = DeviceState::Inactive;
+        vsock.pending_event_ack = state.pending_event_ack;
         Ok(vsock)
     }
 }
@@ -123,8 +128,6 @@ pub(crate) mod tests {
     use super::device::AVAIL_FEATURES;
     use super::*;
     use crate::devices::virtio::device::VirtioDevice;
-    use crate::devices::virtio::test_utils::default_interrupt;
-    use crate::devices::virtio::vsock::defs::uapi;
     use crate::devices::virtio::vsock::test_utils::{TestBackend, TestContext};
     use crate::utils::byte_order;
 
@@ -140,8 +143,31 @@ pub(crate) mod tests {
             }
         }
 
-        fn restore(_: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
+        fn restore(_: Self::ConstructorArgs, _state: &Self::State) -> Result<Self, Self::Error> {
             Ok(TestBackend::new())
+        }
+    }
+
+    #[test]
+    fn test_persist_pending_event_ack() {
+        // The RX gate must survive a save/restore cycle: a restored device must keep
+        // gating RX while a TRANSPORT_RESET ack is outstanding, and must not gate RX
+        // when none is.
+        let mut ctx = TestContext::new();
+        for armed in [false, true] {
+            ctx.device.pending_event_ack = armed;
+            let state = ctx.device.save();
+            assert_eq!(state.pending_event_ack, armed);
+
+            let restored = Vsock::restore(
+                VsockConstructorArgs {
+                    mem: ctx.mem.clone(),
+                    backend: TestBackend::new(),
+                },
+                &state,
+            )
+            .unwrap();
+            assert_eq!(restored.pending_event_ack, armed);
         }
     }
 
@@ -196,27 +222,9 @@ pub(crate) mod tests {
             device_features & driver_features
         );
 
-        // Test reading 32-bit chunks.
-        let mut data = [0u8; 8];
-        restored_device.read_config(0, &mut data[..4]);
-        assert_eq!(
-            u64::from(byte_order::read_le_u32(&data[..])),
-            ctx.cid & 0xffff_ffff
-        );
-        restored_device.read_config(4, &mut data[4..]);
-        assert_eq!(
-            u64::from(byte_order::read_le_u32(&data[4..])),
-            (ctx.cid >> 32) & 0xffff_ffff
-        );
-
-        // Test reading 64-bit.
-        let mut data = [0u8; 8];
-        restored_device.read_config(0, &mut data);
-        assert_eq!(byte_order::read_le_u64(&data), ctx.cid);
-
-        // Check that out-of-bounds reading doesn't mutate the destination buffer.
-        let mut data = [0u8, 1, 2, 3, 4, 5, 6, 7];
-        restored_device.read_config(2, &mut data);
-        assert_eq!(data, [0u8, 1, 2, 3, 4, 5, 6, 7]);
+        // Validate config_as_bytes returns the CID in little-endian.
+        let config = restored_device.config_as_bytes();
+        assert_eq!(config.len(), 8);
+        assert_eq!(byte_order::read_le_u64(config), ctx.cid);
     }
 }

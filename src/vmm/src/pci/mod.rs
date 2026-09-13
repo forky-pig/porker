@@ -42,14 +42,6 @@ pub trait PciDevice: Send {
     /// Gets a register from the configuration space.
     /// * `reg_idx` - The index of the config register to read.
     fn read_config_register(&mut self, reg_idx: u16) -> u32;
-    /// Detects if a BAR is being reprogrammed.
-    fn detect_bar_reprogramming(
-        &mut self,
-        _reg_idx: u16,
-        _data: &[u8],
-    ) -> Option<BarReprogrammingParams> {
-        None
-    }
     /// Reads from a BAR region mapped into the device.
     /// * `addr` - The guest address inside the BAR.
     /// * `data` - Filled with the data from `addr`.
@@ -60,31 +52,6 @@ pub trait PciDevice: Send {
     fn write_bar(&mut self, _base: u64, _offset: u64, _data: &[u8]) -> Option<Arc<Barrier>> {
         None
     }
-    /// Relocates the BAR to a different address in guest address space.
-    fn move_bar(&mut self, _old_base: u64, _new_base: u64) -> Result<(), DeviceRelocationError> {
-        Ok(())
-    }
-}
-
-/// Errors for device manager.
-#[derive(Debug, thiserror::Error, displaydoc::Display)]
-pub enum DeviceRelocationError {
-    /// Device relocation not supported.
-    NotSupported,
-}
-
-/// This trait defines a set of functions which can be triggered whenever a
-/// PCI device is modified in any way.
-pub trait DeviceRelocation: Send + Sync {
-    /// The BAR needs to be moved to a different location in the guest address
-    /// space. This follows a decision from the software running in the guest.
-    fn move_bar(
-        &self,
-        old_base: u64,
-        new_base: u64,
-        len: u64,
-        pci_dev: &mut dyn PciDevice,
-    ) -> Result<(), DeviceRelocationError>;
 }
 
 /// Segment with associated Device BDF
@@ -120,6 +87,49 @@ impl PciSBDF {
                 | (((device & 0x1f) as u32) << 3)
                 | (function & 0x7) as u32,
         )
+    }
+
+    /// Parse SBDF from string
+    /// Accepts the following formats:
+    ///  - full SBDF: 0000:01:02.03
+    ///  - short BDF: 01:02.03
+    pub fn new_from_str(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if s.is_empty() {
+            return None;
+        }
+
+        let mut segment: u16 = 0;
+        let mut bdf_str = s;
+        if let Some((seg_str, rest)) = Self::split_segment_part(s) {
+            segment = u16::from_str_radix(seg_str, 16).ok()?;
+            bdf_str = rest
+        }
+
+        let (bus_str, devfn) = bdf_str.split_once(':')?;
+        let (dev_str, fn_str) = devfn.split_once('.')?;
+
+        let bus = u8::from_str_radix(bus_str, 16).ok()?;
+        let dev = u8::from_str_radix(dev_str, 16).ok()?;
+        let func = u8::from_str_radix(fn_str, 16).ok()?;
+
+        // `dev` can only occupy 5 bits
+        // `func` can only occupy 3 bits
+        if 0x1f < dev || 0x7 < func {
+            return None;
+        }
+
+        Some(PciSBDF::new(segment, bus, dev, func))
+    }
+
+    fn split_segment_part(s: &str) -> Option<(&str, &str)> {
+        let first_colon = s.find(':')?;
+        let rest = &s[first_colon + 1..];
+        if rest.contains(':') {
+            Some((&s[..first_colon], rest))
+        } else {
+            None
+        }
     }
 }
 
@@ -455,5 +465,20 @@ mod tests {
         assert_eq!(sbdf.bus(), 0x56);
         assert_eq!(sbdf.device(), 0x0f);
         assert_eq!(sbdf.function(), 0x0);
+    }
+
+    #[test]
+    fn test_pci_bdf_parse() {
+        let sbdf = PciSBDF::new_from_str("0000:03:01.0").unwrap();
+        assert_eq!(sbdf, PciSBDF::new(0, 3, 1, 0));
+
+        let sbdf = PciSBDF::new_from_str("03:01.0").unwrap();
+        assert_eq!(sbdf, PciSBDF::new(0, 3, 1, 0));
+
+        assert!(PciSBDF::new_from_str("").is_none());
+        // 0x1f < device
+        assert!(PciSBDF::new_from_str("00:20.0").is_none());
+        // 7 < function
+        assert!(PciSBDF::new_from_str("00:00.8").is_none());
     }
 }

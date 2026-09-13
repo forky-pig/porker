@@ -279,7 +279,7 @@ impl VfioDevice {
     /// Iterator over BAR regions (indices 0–5) that the device exposes.
     pub fn bar_regions(&self) -> impl Iterator<Item = &VfioRegionInfo> {
         self.regions.iter().filter(|r| {
-            r.index >= VFIO_PCI_BAR0_REGION_INDEX && r.index <= VFIO_PCI_BAR5_REGION_INDEX
+            (VFIO_PCI_BAR0_REGION_INDEX..=VFIO_PCI_BAR5_REGION_INDEX).contains(&r.index)
         })
     }
 }

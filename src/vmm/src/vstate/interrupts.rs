@@ -7,10 +7,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use kvm_ioctls::VmFd;
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::Vm;
-use crate::logger::{IncMetric, METRICS};
+use crate::logger::{IncMetric, METRICS, error};
 use crate::pci::PciSBDF;
+use crate::pci::msix::MsixTableEntry;
 use crate::snapshot::Persist;
+use crate::vstate::vm::KvmVm;
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 /// Errors related with Firecracker interrupts
@@ -25,19 +26,8 @@ pub enum InterruptError {
     Kvm(#[from] kvm_ioctls::Error),
     /// Invalid vector index: {0}
     InvalidVectorIndex(usize),
-}
-
-/// Configuration data for an MSI-X interrupt.
-#[derive(Copy, Clone, Debug, Default)]
-pub struct MsixVectorConfig {
-    /// High address to delivery message signaled interrupt.
-    pub high_addr: u32,
-    /// Low address to delivery message signaled interrupt.
-    pub low_addr: u32,
-    /// Data to write to delivery message signaled interrupt.
-    pub data: u32,
-    /// Devid of the device to delivery message signaled interrupt.
-    pub devid: PciSBDF,
+    /// MSI-X state size mismatch: {0}
+    MsixStateSizeMismatch(String),
 }
 
 /// Type that describes an allocated interrupt
@@ -87,9 +77,9 @@ impl MsixVector {
 #[derive(Debug)]
 /// MSI interrupts created for a VirtIO device
 pub struct MsixVectorGroup {
-    /// Reference to the Vm object, which we'll need for interacting with the underlying KVM Vm
-    /// file descriptor
-    pub vm: Arc<Vm>,
+    /// Reference to the KvmVm object, which we'll need for interacting with the underlying KVM
+    /// KvmVm file descriptor
+    pub vm: Arc<KvmVm>,
     /// A list of all the MSI-X vectors
     pub vectors: Vec<MsixVector>,
 }
@@ -98,17 +88,8 @@ impl MsixVectorGroup {
     /// Returns the number of vectors in this group
     pub fn num_vectors(&self) -> u16 {
         // It is safe to unwrap here. We are creating `MsixVectorGroup` objects through the
-        // `Vm::create_msix_group` where the argument for the number of `vectors` is a `u16`.
+        // `KvmVm::create_msix_group` where the argument for the number of `vectors` is a `u16`.
         u16::try_from(self.vectors.len()).unwrap()
-    }
-
-    /// Enable the MSI-X vector group
-    pub fn enable(&self) -> Result<(), InterruptError> {
-        for route in &self.vectors {
-            route.enable(&self.vm.common.fd)?;
-        }
-
-        Ok(())
     }
 
     /// Disable the MSI-X vector group
@@ -135,47 +116,115 @@ impl MsixVectorGroup {
         self.vectors.get(index).map(|route| &route.event_fd)
     }
 
-    /// Update the MSI-X configuration for a vector in the group
-    pub fn update(
+    /// Registers the configuration of a vector in the group in the VM.
+    /// Note: this function doesn't set the GSI routes. Please do that separately, or use [update]/[update_batched].
+    pub fn register(
         &self,
         index: usize,
-        msi_config: MsixVectorConfig,
-        masked: bool,
-        set_gsi: bool,
+        table_entry: &MsixTableEntry,
+        pci_sbdf: PciSBDF,
     ) -> Result<(), InterruptError> {
         if let Some(vector) = self.vectors.get(index) {
-            METRICS.interrupts.config_updates.inc();
-            // When an interrupt is masked the GSI will not be passed to KVM through
-            // KVM_SET_GSI_ROUTING. So, call [`disable()`] to unregister the interrupt file
-            // descriptor before passing the interrupt routes to KVM
-            if masked {
-                vector.disable(&self.vm.common.fd)?;
-            }
-
-            self.vm.register_msi(vector, masked, msi_config)?;
-            if set_gsi {
-                self.vm
-                    .set_gsi_routes()
-                    .map_err(|err| std::io::Error::other(format!("MSI-X update: {err}")))?
-            }
-
-            // Assign KVM_IRQFD after KVM_SET_GSI_ROUTING to avoid
-            // panic on kernel which does not have commit a80ced6ea514
-            // (KVM: SVM: fix panic on out-of-bounds guest IRQ).
-            if !masked {
-                vector.enable(&self.vm.common.fd)?;
-            }
-
+            self.vm.register_msi(vector, table_entry, pci_sbdf)?;
             return Ok(());
         }
 
         Err(InterruptError::InvalidVectorIndex(index))
     }
+
+    /// Update the MSI-X configuration for all vectors in the group
+    pub fn update_batched(
+        &self,
+        msi_config: &[MsixTableEntry],
+        pci_sbdf: PciSBDF,
+    ) -> Result<(), InterruptError> {
+        self.update_vectors(msi_config, &self.vectors, pci_sbdf)
+    }
+
+    /// Update the MSI-X configuration for a vector in the group
+    pub fn update(
+        &self,
+        index: usize,
+        table_entry: &MsixTableEntry,
+        pci_sbdf: PciSBDF,
+    ) -> Result<(), InterruptError> {
+        if let Some(vector) = self.vectors.get(index) {
+            self.update_vectors(
+                std::slice::from_ref(table_entry),
+                std::slice::from_ref(vector),
+                pci_sbdf,
+            )
+        } else {
+            Err(InterruptError::InvalidVectorIndex(index))
+        }
+    }
+
+    /// Update the MSI-X configuration for the given vectors
+    fn update_vectors(
+        &self,
+        table_entries: &[MsixTableEntry],
+        vectors: &[MsixVector],
+        pci_sbdf: PciSBDF,
+    ) -> Result<(), InterruptError> {
+        assert_eq!(table_entries.len(), vectors.len());
+
+        METRICS.interrupts.config_updates.inc();
+
+        // Disables masked vectors and update the config
+        for (idx, vector) in vectors.iter().enumerate() {
+            let table_entry = &table_entries[idx];
+            if table_entry.masked() {
+                vector.disable(&self.vm.common.fd)?;
+            }
+            self.vm.register_msi(vector, table_entry, pci_sbdf)?;
+        }
+
+        self.vm
+            .set_gsi_routes()
+            .map_err(|err| std::io::Error::other(format!("MSI-X update: {err}")))?;
+
+        // Enables unmasked. Must be done after set_gsi_routes to avoid panic on kernel
+        // which does not have commit a80ced6ea514 (KVM: SVM: fix panic on out-of-bounds guest IRQ).
+        for (idx, vector) in vectors.iter().enumerate() {
+            if !table_entries[idx].masked() {
+                vector.enable(&self.vm.common.fd)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for MsixVectorGroup {
+    fn drop(&mut self) {
+        let vmfd = &self.vm.common.fd;
+
+        {
+            let mut interrupts = self.vm.common.interrupts.lock().expect("Poisoned lock");
+            for vector in &self.vectors {
+                if let Err(e) = vector.disable(vmfd) {
+                    error!("Failed to unregister irqfd for GSI {}: {e}", vector.gsi);
+                }
+                interrupts.remove(&vector.gsi);
+            }
+        }
+
+        let mut allocator = self
+            .vm
+            .common
+            .resource_allocator
+            .lock()
+            .expect("Poisoned lock");
+        for vector in &self.vectors {
+            // SAFETY: we allocated gsi from this allocator.
+            allocator.gsi_msi_allocator.free_id(vector.gsi).unwrap();
+        }
+    }
 }
 
 impl<'a> Persist<'a> for MsixVectorGroup {
     type State = Vec<u32>;
-    type ConstructorArgs = Arc<Vm>;
+    type ConstructorArgs = Arc<KvmVm>;
     type Error = InterruptError;
 
     fn save(&self) -> Self::State {
@@ -191,8 +240,14 @@ impl<'a> Persist<'a> for MsixVectorGroup {
     ) -> Result<Self, Self::Error> {
         let mut vectors = Vec::with_capacity(state.len());
 
-        for gsi in state {
-            vectors.push(MsixVector::new(*gsi, false)?);
+        {
+            // Replay the GSI allocations rather than trusting the serialized allocator state.
+            // This validates the snapshot is not malformed, containing doubly allocated GSI IDs
+            let mut resource_allocator = constructor_args.resource_allocator();
+            for gsi in state {
+                resource_allocator.gsi_msi_allocator.allocate_id_at(*gsi)?;
+                vectors.push(MsixVector::new(*gsi, false)?);
+            }
         }
 
         Ok(MsixVectorGroup {

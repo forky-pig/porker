@@ -1,10 +1,7 @@
 // Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::convert::Infallible;
-
 use acpi_tables::{Aml, aml};
-use aws_lc_rs::error::Unspecified as RandError;
 use aws_lc_rs::rand;
 use serde::{Deserialize, Serialize};
 use vm_memory::{GuestAddress, GuestMemoryError};
@@ -14,7 +11,7 @@ use vmm_sys_util::eventfd::EventFd;
 use super::super::legacy::EventFdTrigger;
 use crate::logger::debug;
 use crate::snapshot::Persist;
-use crate::vstate::memory::{Bytes, GuestMemoryMmap};
+use crate::vstate::memory::{Bytes, GuestMemoryExtension, GuestMemoryMmap};
 use crate::vstate::resources::ResourceAllocator;
 
 /// Bytes of memory we allocate for VMGenID device
@@ -84,8 +81,10 @@ impl VmGenId {
             .map_err(VmGenIdError::AllocateGsi)?[0];
         // The generation ID needs to live in an 8-byte aligned buffer
         let addr = resource_allocator
-            .allocate_system_memory(VMGENID_MEM_SIZE, 8, vm_allocator::AllocPolicy::LastMatch)
-            .map_err(VmGenIdError::AllocateMemory)?;
+            .system_memory
+            .allocate(VMGENID_MEM_SIZE, 8, vm_allocator::AllocPolicy::LastMatch)
+            .map_err(VmGenIdError::AllocateMemory)?
+            .start();
 
         Self::from_parts(GuestAddress(addr), gsi)
     }
@@ -115,6 +114,7 @@ impl VmGenId {
             "vmgenid: writing new generation ID to guest: {:#034x}",
             self.gen_id
         );
+        mem.check_range_plugged(self.guest_address, self.gen_id.to_le_bytes().len())?;
         mem.write_slice(&self.gen_id.to_le_bytes(), self.guest_address)
             .map_err(VmGenIdError::WriteGuestMemory)?;
 

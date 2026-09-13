@@ -32,7 +32,6 @@ use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
 use crate::devices::virtio::queue::InvalidAvailIdx;
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::logger::{IncMetric, debug, error, info, log_dev_preview_warning, warn};
-use crate::utils::u64_to_usize;
 use crate::vstate::memory::{
     Address, ByteValued, Bytes, GuestAddress, GuestMemoryExtension, GuestMemoryMmap,
 };
@@ -92,7 +91,7 @@ fn default_ack_on_stop() -> bool {
     true
 }
 
-/// Command recieved from the API to start a hinting run
+/// Command received from the API to start a hinting run
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct StartHintingCmd {
     /// If we should automatically acknowledge end of the run after stop.
@@ -550,8 +549,6 @@ impl Balloon {
         let mut complete = false;
 
         while let Some(head) = queue.pop()? {
-            let head_index = head.index;
-
             let mut last_desc = Some(head);
             while let Some(desc) = last_desc {
                 last_desc = desc.next_descriptor();
@@ -612,7 +609,7 @@ impl Balloon {
         }
 
         if complete && self.hinting_state.acknowledge_on_finish {
-            self.update_free_page_hint_cmd(FREE_PAGE_HINT_DONE);
+            self.update_free_page_hint_cmd(FREE_PAGE_HINT_DONE)?;
         }
 
         Ok(())
@@ -630,8 +627,6 @@ impl Balloon {
         let mut needs_interrupt = false;
 
         while let Some(head) = queue.pop()? {
-            let head_index = head.index;
-
             let mut last_desc = Some(head);
             while let Some(desc) = last_desc {
                 METRICS.free_page_report_count.inc();
@@ -773,10 +768,13 @@ impl Balloon {
             return Err(BalloonError::StatisticsStateChange);
         }
 
-        self.trigger_stats_update()?;
-
         self.stats_polling_interval_s = interval_s;
-        self.update_timer_state();
+
+        if self.is_activated() {
+            self.trigger_stats_update()?;
+            self.update_timer_state();
+        }
+
         Ok(())
     }
 
@@ -927,13 +925,8 @@ impl VirtioDevice for Balloon {
             .deref()
     }
 
-    fn read_config(&self, offset: u64, data: &mut [u8]) {
-        if let Some(config_space_bytes) = self.config_space.as_slice().get(u64_to_usize(offset)..) {
-            let len = config_space_bytes.len().min(data.len());
-            data[..len].copy_from_slice(&config_space_bytes[..len]);
-        } else {
-            error!("Failed to read config space");
-        }
+    fn config_as_bytes(&self) -> &[u8] {
+        self.config_space.as_slice()
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
@@ -944,7 +937,12 @@ impl VirtioDevice for Balloon {
             .zip(end)
             .and_then(|(start, end)| config_space_bytes.get_mut(start..end))
         else {
-            error!("Failed to write config space");
+            warn!(
+                "virtio-balloon: guest driver attempted to write device config out of bounds \
+                 (offset={:#x}, len={:#x})",
+                offset,
+                data.len()
+            );
             return;
         };
 
@@ -956,6 +954,8 @@ impl VirtioDevice for Balloon {
         mem: GuestMemoryMmap,
         interrupt: Arc<dyn VirtioInterrupt>,
     ) -> Result<(), ActivateError> {
+        assert!(!self.is_activated());
+
         for q in self.queues.iter_mut() {
             q.initialize(&mem)
                 .map_err(ActivateError::QueueMemoryError)?;
@@ -979,6 +979,20 @@ impl VirtioDevice for Balloon {
         self.device_state.is_activated()
     }
 
+    fn deactivate(&mut self) {
+        self.device_state = DeviceState::Inactive;
+    }
+
+    fn _reset(&mut self) -> bool {
+        self.config_space.actual_pages = 0;
+        self.config_space.free_page_hint_cmd_id = FREE_PAGE_HINT_STOP;
+        self.stats_timer.arm(Duration::ZERO, None);
+        self.stats_desc_index = None;
+        self.latest_stats = BalloonStats::default();
+        self.hinting_state = Default::default();
+        true
+    }
+
     fn kick(&mut self) {
         if self.is_activated() {
             if self.free_page_hinting() {
@@ -987,7 +1001,13 @@ impl VirtioDevice for Balloon {
                     self.device_type(),
                     self.id()
                 );
-                self.update_free_page_hint_cmd(FREE_PAGE_HINT_DONE);
+                if let Err(err) = self.update_free_page_hint_cmd(FREE_PAGE_HINT_DONE) {
+                    error!(
+                        "[{:?}:{}] failed to reset free page hinting: {err}",
+                        self.device_type(),
+                        self.id()
+                    );
+                }
             }
             self.notify_queue_events();
         }
@@ -1001,7 +1021,6 @@ pub(crate) mod tests {
     use super::super::BALLOON_CONFIG_SPACE_SIZE;
     use super::*;
     use crate::arch::host_page_size;
-    use crate::check_metric_after_block;
     use crate::devices::virtio::balloon::report_balloon_event_fail;
     use crate::devices::virtio::balloon::test_utils::{
         check_request_completion, invoke_handler_for_queue_event, set_request,
@@ -1012,8 +1031,8 @@ pub(crate) mod tests {
     };
     use crate::devices::virtio::test_utils::{VirtQueue, default_interrupt, default_mem};
     use crate::test_utils::single_region_mem;
-    use crate::utils::align_up;
     use crate::vstate::memory::GuestAddress;
+    use crate::{align_up, check_metric_after_block};
 
     impl VirtioTestDevice for Balloon {
         fn set_queues(&mut self, queues: Vec<Queue>) {
@@ -1181,7 +1200,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_virtio_read_config() {
+    fn test_config_as_bytes() {
         let balloon = Balloon::new(0x10, true, 0, false, false).unwrap();
 
         let cfg = BalloonConfig {
@@ -1193,29 +1212,14 @@ pub(crate) mod tests {
         };
         assert_eq!(balloon.config(), cfg);
 
-        let mut actual_config_space = [0u8; BALLOON_CONFIG_SPACE_SIZE];
-        balloon.read_config(0, &mut actual_config_space);
-        // The first 4 bytes are num_pages, the last 4 bytes are actual_pages.
-        // The config space is little endian.
-        // 0x10 MB in the constructor corresponds to 0x1000 pages in the
-        // config space.
-        let expected_config_space: [u8; BALLOON_CONFIG_SPACE_SIZE] = [
+        let config = balloon.config_as_bytes();
+        assert_eq!(config.len(), BALLOON_CONFIG_SPACE_SIZE);
+        // The first 4 bytes are num_pages (LE), the last 4 bytes are actual_pages.
+        // 0x10 MB = 0x1000 pages.
+        let expected: [u8; BALLOON_CONFIG_SPACE_SIZE] = [
             0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
-        assert_eq!(actual_config_space, expected_config_space);
-
-        // Invalid read.
-        let expected_config_space: [u8; BALLOON_CONFIG_SPACE_SIZE] = [
-            0xd, 0xe, 0xa, 0xd, 0xb, 0xe, 0xe, 0xf, 0x00, 0x00, 0x00, 0x00,
-        ];
-        actual_config_space = expected_config_space;
-        balloon.read_config(
-            BALLOON_CONFIG_SPACE_SIZE as u64 + 1,
-            &mut actual_config_space,
-        );
-
-        // Validate read failed (the config space was not updated).
-        assert_eq!(actual_config_space, expected_config_space);
+        assert_eq!(config, expected);
     }
 
     #[test]
@@ -1588,9 +1592,9 @@ pub(crate) mod tests {
         let page_size_chain = page_size as u32;
         let reporting_idx = th.device().free_page_reporting_idx();
 
-        let safe_addr = align_up(th.data_address(), page_size);
+        let safe_addr = align_up!(th.data_address(), page_size);
 
-        th.add_scatter_gather(reporting_idx, 0, &[(0, safe_addr, page_size_chain, 0)]);
+        th.add_scatter_gather(reporting_idx, &[(0, safe_addr, page_size_chain, 0)]);
         check_metric_after_block!(
             METRICS.free_page_report_freed,
             page_size,
@@ -1600,7 +1604,6 @@ pub(crate) mod tests {
         // Test with multiple items
         th.add_scatter_gather(
             reporting_idx,
-            0,
             &[
                 (0, safe_addr, page_size_chain, 0),
                 (1, safe_addr + page_size, page_size_chain, 0),
@@ -1615,7 +1618,7 @@ pub(crate) mod tests {
         );
 
         // Test with unaligned length
-        th.add_scatter_gather(reporting_idx, 0, &[(1, safe_addr + 1, page_size_chain, 0)]);
+        th.add_scatter_gather(reporting_idx, &[(1, safe_addr + 1, page_size_chain, 0)]);
 
         check_metric_after_block!(
             METRICS.free_page_report_fails,
@@ -1637,13 +1640,13 @@ pub(crate) mod tests {
         fn new(mem: &'a GuestMemoryMmap) -> Self {
             let mut th = VirtioTestHelper::<Balloon>::new(
                 mem,
-                Balloon::new(0, true, 0, true, false).unwrap(),
+                Balloon::new(0, true, 0, true, true).unwrap(),
             );
             th.activate_device(mem);
 
             let page_size = host_page_size() as u64;
             let hinting_idx = th.device().free_page_hinting_idx();
-            let safe_addr = align_up(th.data_address(), page_size);
+            let safe_addr = align_up!(th.data_address(), page_size);
 
             // Ack the config set on start
             th.device()
@@ -1685,7 +1688,6 @@ pub(crate) mod tests {
                 .unwrap();
             self.th.add_scatter_gather(
                 self.hinting_idx,
-                0,
                 &[
                     (0, self.safe_addr, 4, VIRTQ_DESC_F_WRITE),
                     (
@@ -1738,7 +1740,7 @@ pub(crate) mod tests {
                     )]
                 }
             };
-            self.th.add_scatter_gather(self.hinting_idx, 0, &payload);
+            self.th.add_scatter_gather(self.hinting_idx, &payload);
             check_metric_after_block!(
                 METRICS.free_page_hint_freed,
                 expected,
@@ -1815,7 +1817,6 @@ pub(crate) mod tests {
 
         // Test the good case
         ht.start_hinting(None);
-        let mut host_cmd = ht.th.device().get_hinting_status().unwrap().host_cmd;
 
         // Simulate the driver finishing a run. Any reported values after
         // should be ignored
@@ -1825,7 +1826,7 @@ pub(crate) mod tests {
         ht.test_hinting(None, 0);
 
         // As we had auto ack on finish the host cmd should be set to done
-        host_cmd = ht.th.device().get_hinting_status().unwrap().host_cmd;
+        let host_cmd = ht.th.device().get_hinting_status().unwrap().host_cmd;
         assert_eq!(host_cmd, FREE_PAGE_HINT_DONE);
     }
 
@@ -1836,14 +1837,13 @@ pub(crate) mod tests {
 
         // Test the good case
         ht.start_hinting(None);
-        let mut host_cmd = ht.th.device().get_hinting_status().unwrap().host_cmd;
 
         // Test no ack on stop behaviour
         ht.start_hinting(Some(StartHintingCmd {
             acknowledge_on_stop: false,
         }));
 
-        host_cmd = ht.th.device().get_hinting_status().unwrap().host_cmd;
+        let host_cmd = ht.th.device().get_hinting_status().unwrap().host_cmd;
         ht.test_hinting(Some(host_cmd), ht.page_size);
         ht.test_hinting(None, ht.page_size);
 
@@ -1859,14 +1859,13 @@ pub(crate) mod tests {
 
         // Test the good case
         ht.start_hinting(None);
-        let mut host_cmd = ht.th.device().get_hinting_status().unwrap().host_cmd;
+        let host_cmd = ht.th.device().get_hinting_status().unwrap().host_cmd;
 
         ht.test_hinting(Some(host_cmd), ht.page_size);
         ht.test_hinting(None, ht.page_size);
 
         ht.th.add_scatter_gather(
             ht.hinting_idx,
-            0,
             &[(0, ht.safe_addr + ht.page_size + 1, ht.page_size_chain, 0)],
         );
 
@@ -1925,6 +1924,37 @@ pub(crate) mod tests {
         );
         balloon.update_stats_polling_interval(1).unwrap();
         balloon.update_stats_polling_interval(2).unwrap();
+    }
+
+    #[test]
+    fn test_update_stats_interval_after_reset() {
+        let mut balloon = Balloon::new(0, true, 1, false, false).unwrap();
+        let mem = default_mem();
+        let q = VirtQueue::new(GuestAddress(0), &mem, 16);
+        balloon.set_queue(INFLATE_INDEX, q.create_queue());
+        balloon.set_queue(DEFLATE_INDEX, q.create_queue());
+        balloon.set_queue(STATS_INDEX, q.create_queue());
+        balloon.activate(mem.clone(), default_interrupt()).unwrap();
+        assert!(balloon.stats_timer.is_armed());
+
+        // A guest reset leaves the stats timerfd registered with the event
+        // loop while the device is inactive, so an interval update must not
+        // arm it.
+        assert!(balloon.reset());
+        assert!(!balloon.is_activated());
+        assert!(!balloon.stats_timer.is_armed());
+
+        balloon.update_stats_polling_interval(2).unwrap();
+        assert_eq!(balloon.stats_polling_interval_s(), 2);
+        assert!(!balloon.stats_timer.is_armed());
+
+        // The guest re-programs the queues and activates the device again,
+        // which picks up the interval set while it was inactive.
+        balloon.set_queue(INFLATE_INDEX, q.create_queue());
+        balloon.set_queue(DEFLATE_INDEX, q.create_queue());
+        balloon.set_queue(STATS_INDEX, q.create_queue());
+        balloon.activate(mem, default_interrupt()).unwrap();
+        assert!(balloon.stats_timer.is_armed());
     }
 
     #[test]

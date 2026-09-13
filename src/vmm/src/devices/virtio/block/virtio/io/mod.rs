@@ -75,7 +75,6 @@ impl FileEngine {
         Ok(())
     }
 
-    #[cfg(test)]
     pub fn file(&self) -> &File {
         match self {
             FileEngine::Async(engine) => engine.file(),
@@ -157,6 +156,29 @@ impl FileEngine {
         }
     }
 
+    pub fn discard(
+        &mut self,
+        range: (u64, u32),
+        req: PendingRequest,
+    ) -> Result<FileEngineOk, RequestError<BlockIoError>> {
+        match self {
+            FileEngine::Async(engine) => match engine.discard(range) {
+                Ok(count) => Ok(FileEngineOk::Executed(RequestOk { req, count })),
+                Err(err) => Err(RequestError {
+                    req,
+                    error: BlockIoError::Async(err),
+                }),
+            },
+            FileEngine::Sync(engine) => match engine.discard(range) {
+                Ok(count) => Ok(FileEngineOk::Executed(RequestOk { req, count })),
+                Err(err) => Err(RequestError {
+                    req,
+                    error: BlockIoError::Sync(err),
+                }),
+            },
+        }
+    }
+
     pub fn drain(&mut self, discard: bool) -> Result<(), BlockIoError> {
         match self {
             FileEngine::Async(engine) => engine.drain(discard).map_err(BlockIoError::Async),
@@ -179,7 +201,7 @@ pub mod tests {
     #![allow(clippy::undocumented_unsafe_blocks)]
     use std::os::unix::ffi::OsStrExt;
 
-    use vm_memory::GuestMemoryRegion;
+    use vm_memory::{GuestMemoryBackend, GuestMemoryRegion};
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
@@ -187,7 +209,7 @@ pub mod tests {
     use crate::utils::u64_to_usize;
     use crate::vmm_config::machine_config::HugePageConfig;
     use crate::vstate::memory;
-    use crate::vstate::memory::{Bitmap, Bytes, GuestMemory, GuestRegionMmapExt};
+    use crate::vstate::memory::{Bitmap, Bytes, GuestRegionMmapExt};
 
     const FILE_LEN: u32 = 1024;
     // 2 pages of memory should be enough to test read/write ops and also dirty tracking.

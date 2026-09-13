@@ -63,9 +63,9 @@ pub enum ResourcesError {
     /// Vsock device error: {0}
     VsockDevice(#[from] VsockConfigError),
     /// Entropy device error: {0}
-    EntropyDevice(#[from] EntropyDeviceError),
+    EntropyConfig(#[from] EntropyDeviceError),
     /// Pmem device error: {0}
-    PmemDevice(#[from] PmemConfigError),
+    PmemConfig(#[from] PmemConfigError),
     /// Memory hotplug config error: {0}
     MemoryHotplugConfig(#[from] MemoryHotplugConfigError),
 }
@@ -120,7 +120,7 @@ pub struct VmResources {
     pub net_builder: NetBuilder,
     /// The entropy device builder.
     pub entropy: EntropyDeviceBuilder,
-    /// The pmem devices.
+    /// The pmem device configs.
     pub pmem: PmemBuilder,
     /// The memory hotplug configuration.
     pub memory_hotplug: Option<MemoryHotplugConfig>,
@@ -577,7 +577,7 @@ impl From<&VmResources> for VmmConfig {
             network_interfaces: resources.net_builder.configs(),
             vsock: resources.vsock.config(),
             entropy: resources.entropy.config(),
-            pmem_devices: resources.pmem.configs(),
+            pmem_devices: resources.pmem.configs.clone(),
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots.
             serial_config: None,
             memory_hotplug: resources.memory_hotplug.clone(),
@@ -606,10 +606,9 @@ mod tests {
     use crate::resources::VmResources;
     use crate::utils::net::mac::MacAddr;
     use crate::vmm_config::RateLimiterConfig;
-    use crate::vmm_config::boot_source::{
-        BootConfig, BootSource, BootSourceConfig, DEFAULT_KERNEL_CMDLINE,
-    };
+    use crate::vmm_config::boot_source::{BootConfig, BootSource, BootSourceConfig};
     use crate::vmm_config::drive::{BlockBuilder, BlockDeviceConfig};
+    use crate::vmm_config::machine_config::HugePageConfig::{Hugetlbfs2M, Transparent};
     use crate::vmm_config::machine_config::{HugePageConfig, MachineConfig, MachineConfigError};
     use crate::vmm_config::net::{NetBuilder, NetworkInterfaceConfig};
     use crate::vmm_config::vsock::tests::default_config;
@@ -626,6 +625,7 @@ mod tests {
                 .unwrap()
                 .to_string(),
             guest_mac: Some(MacAddr::from_str("01:23:45:67:89:0a").unwrap()),
+            mtu: None,
             rx_rate_limiter: Some(RateLimiterConfig::default()),
             tx_rate_limiter: Some(RateLimiterConfig::default()),
         }
@@ -648,9 +648,12 @@ mod tests {
                 cache_type: CacheType::Unsafe,
 
                 is_read_only: Some(false),
+                discard: None,
                 path_on_host: Some(tmp_file.as_path().to_str().unwrap().to_string()),
                 rate_limiter: Some(RateLimiterConfig::default()),
                 file_engine_type: None,
+                blk_size: None,
+                topology: None,
 
                 socket: None,
             },
@@ -666,13 +669,11 @@ mod tests {
     }
 
     fn default_boot_cfg() -> BootSource {
-        let kernel_cmdline =
-            linux_loader::cmdline::Cmdline::try_from(DEFAULT_KERNEL_CMDLINE, 4096).unwrap();
         let tmp_file = TempFile::new().unwrap();
         BootSource {
             config: BootSourceConfig::default(),
             builder: Some(BootConfig {
-                cmdline: kernel_cmdline,
+                cmdline: None,
                 kernel_file: File::open(tmp_file.as_path()).unwrap(),
                 initrd_file: Some(File::open(tmp_file.as_path()).unwrap()),
             }),
@@ -1268,7 +1269,15 @@ mod tests {
                             "path_on_host": "{}",
                             "is_root_device": true,
                             "is_read_only": false,
-                            "io_engine": "Sync"
+                            "discard": false,
+                            "io_engine": "Sync",
+                            "blk_size": 512,
+                            "topology": {{
+                                "physical_block_exp": 0,
+                                "alignment_offset": 0,
+                                "min_io_size": 0,
+                                "opt_io_size": 128
+                            }}
                         }}
                     ],
                     "network-interfaces": [
@@ -1343,7 +1352,15 @@ mod tests {
                             "path_on_host": "{}",
                             "is_root_device": true,
                             "is_read_only": false,
-                            "io_engine": "Sync"
+                            "discard": false,
+                            "io_engine": "Sync",
+                            "blk_size": 512,
+                            "topology": {{
+                                "physical_block_exp": 0,
+                                "alignment_offset": 0,
+                                "min_io_size": 0,
+                                "opt_io_size": 128
+                            }}
                         }}
                     ],
                     "network-interfaces": [
@@ -1403,7 +1420,15 @@ mod tests {
                             "path_on_host": "{}",
                             "is_root_device": true,
                             "is_read_only": false,
-                            "io_engine": "Sync"
+                            "discard": false,
+                            "io_engine": "Sync",
+                            "blk_size": 512,
+                            "topology": {{
+                                "physical_block_exp": 0,
+                                "alignment_offset": 0,
+                                "min_io_size": 0,
+                                "opt_io_size": 128
+                            }}
                         }}
                     ],
                     "network-interfaces": [
@@ -1506,6 +1531,26 @@ mod tests {
         assert_eq!(
             vm_resources.update_machine_config(&aux_vm_config),
             Err(MachineConfigError::InvalidMemorySize)
+        );
+
+        // Odd memory size - not supported by THP/Hugetlbfs
+        aux_vm_config.mem_size_mib = Some(1025);
+        aux_vm_config.huge_pages = Some(Transparent);
+        assert_eq!(
+            vm_resources.update_machine_config(&aux_vm_config),
+            Err(MachineConfigError::InvalidMemorySize)
+        );
+        aux_vm_config.huge_pages = Some(Hugetlbfs2M);
+        assert_eq!(
+            vm_resources.update_machine_config(&aux_vm_config),
+            Err(MachineConfigError::InvalidMemorySize)
+        );
+        // Odd size supported by HugePageConfig::None
+        aux_vm_config.huge_pages = Some(HugePageConfig::None);
+        vm_resources.update_machine_config(&aux_vm_config).unwrap();
+        assert_eq!(
+            MachineConfigUpdate::from(vm_resources.machine_config.clone()),
+            aux_vm_config
         );
 
         // Incompatible mem_size_mib with balloon size.
@@ -1612,12 +1657,12 @@ mod tests {
         let tmp_ino = tmp_file.as_file().metadata().unwrap().st_ino();
 
         assert_ne!(
-            boot_builder
-                .cmdline
+            boot_builder.cmdline.as_ref().map(|c| c
                 .as_cstring()
                 .unwrap()
-                .as_bytes_with_nul(),
-            [cmdline.as_bytes(), b"\0"].concat()
+                .as_bytes_with_nul()
+                .to_vec()),
+            Some([cmdline.as_bytes(), b"\0"].concat())
         );
         assert_ne!(
             boot_builder.kernel_file.metadata().unwrap().st_ino(),
@@ -1639,6 +1684,8 @@ mod tests {
         assert_eq!(
             boot_source_builder
                 .cmdline
+                .as_ref()
+                .unwrap()
                 .as_cstring()
                 .unwrap()
                 .as_bytes_with_nul(),
@@ -1710,8 +1757,8 @@ mod tests {
             path_on_host: tmp_file.as_path().to_str().unwrap().to_string(),
             ..Default::default()
         };
-        assert_eq!(vm_resources.pmem.devices.len(), 0);
+        assert_eq!(vm_resources.pmem.configs.len(), 0);
         vm_resources.build_pmem_device(cfg).unwrap();
-        assert_eq!(vm_resources.pmem.devices.len(), 1);
+        assert_eq!(vm_resources.pmem.configs.len(), 1);
     }
 }

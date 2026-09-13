@@ -3,9 +3,6 @@
 
 use std::ffi::{CString, NulError, OsString};
 use std::fmt::{Debug, Display};
-use std::fs::OpenOptions;
-use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::{env as p_env, fs, io};
 
@@ -23,8 +20,8 @@ mod env;
 mod resource_limits;
 
 const JAILER_VERSION: &str = env!("CARGO_PKG_VERSION");
-const PORKER_VERSION: &str = "0.1.0";
-const PORKER_FORK_BASE: &str = "a481d51d0";
+const PORKER_VERSION: &str = "0.1.1";
+const PORKER_FORK_BASE: &str = "95f868c8e";
 
 #[derive(Debug, thiserror::Error)]
 pub enum JailerError {
@@ -255,25 +252,12 @@ where
     T: AsRef<Path> + Debug,
     V: Display + Debug,
 {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(file_path.as_ref())
-        .map_err(|err| JailerError::Write(PathBuf::from(file_path.as_ref()), err))?;
-    io::Write::write_all(&mut file, format!("{}\n", value).as_bytes())
+    fs::write(file_path, format!("{}\n", value))
         .map_err(|err| JailerError::Write(PathBuf::from(file_path.as_ref()), err))
 }
 
 pub fn readln_special<T: AsRef<Path> + Debug>(file_path: &T) -> Result<String, JailerError> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(file_path.as_ref())
-        .map_err(|err| JailerError::ReadToString(PathBuf::from(file_path.as_ref()), err))?;
-    let mut line = String::new();
-    file.read_to_string(&mut line)
+    let mut line = fs::read_to_string(file_path)
         .map_err(|err| JailerError::ReadToString(PathBuf::from(file_path.as_ref()), err))?;
 
     // Remove the newline character at the end (if any).
@@ -326,9 +310,8 @@ fn close_inherited_fds_except(protected: &[i32]) -> Result<(), JailerError> {
             std::io::Error::from_raw_os_error(libc::EINVAL),
         ))?;
     }
-    if cursor <= libc::c_uint::MAX {
-        close_range_raw(cursor, libc::c_uint::MAX)?;
-    }
+    // `cursor` cannot have overflowed here (checked_add above), so close the rest.
+    close_range_raw(cursor, libc::c_uint::MAX)?;
     Ok(())
 }
 
@@ -497,7 +480,7 @@ mod tests {
 
         let mut fds = Vec::new();
         for i in 0..n {
-            let maybe_file = File::create(format!("{}/{}", &tmp_dir_path, i));
+            let maybe_file = File::create(format!("{}/{}", tmp_dir_path, i));
             fds.push(maybe_file.unwrap().into_raw_fd());
         }
 

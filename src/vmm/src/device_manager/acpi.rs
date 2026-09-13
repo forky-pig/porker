@@ -4,10 +4,10 @@
 #[cfg(target_arch = "x86_64")]
 use acpi_tables::{Aml, aml};
 
-use crate::Vm;
 use crate::devices::acpi::vmclock::{VmClock, VmClockError};
 use crate::devices::acpi::vmgenid::{VmGenId, VmGenIdError};
 use crate::vstate::memory::GuestMemoryMmap;
+use crate::vstate::vm::KvmVm;
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum ACPIDeviceError {
@@ -17,6 +17,8 @@ pub enum ACPIDeviceError {
     VmClock(#[from] VmClockError),
     /// Could not register IRQ with KVM: {0}
     RegisterIrq(#[from] kvm_ioctls::Error),
+    /// Resource allocator error: {0}
+    ResourceAllocator(#[from] vm_allocator::Error),
 }
 
 // Although both VMGenID and VMClock devices are always present, they should be instantiated when
@@ -38,12 +40,12 @@ impl ACPIDeviceManager {
         }
     }
 
-    pub fn attach_vmgenid(&mut self, vm: &Vm) -> Result<(), ACPIDeviceError> {
+    pub fn attach_vmgenid(&mut self, vm: &KvmVm) -> Result<(), ACPIDeviceError> {
         self.vmgenid = Some(VmGenId::new(&mut vm.resource_allocator())?);
         Ok(())
     }
 
-    pub fn attach_vmclock(&mut self, vm: &Vm) -> Result<(), ACPIDeviceError> {
+    pub fn attach_vmclock(&mut self, vm: &KvmVm) -> Result<(), ACPIDeviceError> {
         self.vmclock = Some(VmClock::new(&mut vm.resource_allocator())?);
         Ok(())
     }
@@ -56,15 +58,26 @@ impl ACPIDeviceManager {
         self.vmclock.as_ref().expect("Missing VMClock device")
     }
 
-    pub fn activate_vmgenid(&self, vm: &Vm) -> Result<(), ACPIDeviceError> {
+    pub fn activate_vmgenid(&self, vm: &KvmVm) -> Result<(), ACPIDeviceError> {
         vm.register_irq(&self.vmgenid().interrupt_evt, self.vmgenid().gsi)?;
         self.vmgenid().activate(vm.guest_memory())?;
         Ok(())
     }
 
-    pub fn activate_vmclock(&self, vm: &Vm) -> Result<(), ACPIDeviceError> {
+    pub fn activate_vmclock(&self, vm: &KvmVm) -> Result<(), ACPIDeviceError> {
         vm.register_irq(&self.vmclock().interrupt_evt, self.vmclock().gsi)?;
         self.vmclock().activate(vm.guest_memory())?;
+        Ok(())
+    }
+
+    pub fn replay_gsi_allocations(&self, vm: &KvmVm) -> Result<(), ACPIDeviceError> {
+        let mut resource_allocator = vm.resource_allocator();
+        resource_allocator
+            .gsi_legacy_allocator
+            .allocate_id_at(self.vmgenid().gsi)?;
+        resource_allocator
+            .gsi_legacy_allocator
+            .allocate_id_at(self.vmclock().gsi)?;
         Ok(())
     }
 
